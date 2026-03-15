@@ -441,8 +441,7 @@ async def lanzar_analisis(rid, restaurante, update):
     ciudad  = restaurante.get('ciudad','')
     cocina  = restaurante.get('tipo_cocina','')
 
-    prompt = f"""Eres ChefPanda, sistema experto en gestion de reputacion online para restaurantes.
-Hablas directo al dueno como consultor de confianza. Conciso, accionable, sin relleno.
+    prompt = f"""Eres ChefPanda, experto en reputacion online para restaurantes. IMPORTANTE: Sé MUY conciso en cada campo. Maximo 15 palabras por campo de texto, 25 en descripciones largas.
 
 RESTAURANTE: {nombre}
 TIPO DE COCINA: {cocina}
@@ -458,13 +457,7 @@ Responde SOLO en JSON valido sin texto adicional ni bloques de codigo:
 {{
   "titular": "frase que capture el estado real orientada a oportunidad, no a critica",
   "pandascore": 52,
-  "pandascore_desglose": {{
-    "plataformas": 35,
-    "volumen_resenas": 15,
-    "ratio_respuestas": 0,
-    "tendencia": 9,
-    "penalizaciones": -7
-  }},
+  "pandascore_desglose": {{"plataformas": 35, "volumen_resenas": 15, "ratio_respuestas": 0, "tendencia": 9, "penalizaciones": -7}},
   "pandascore_estimado_30dias": 70,
   "tendencia": "estable",
   "fortalezas_top3": [
@@ -526,17 +519,17 @@ Responde SOLO en JSON valido sin texto adicional ni bloques de codigo:
     "Respuesta completa lista para copiar para resena positiva destacada. Personalizada y calida."
   ],
   "oportunidades_estrategicas": [
-    "Oportunidad 1: descripcion con evidencia del mercado y accion especifica con impacto estimado",
-    "Oportunidad 2: descripcion con evidencia del mercado y accion especifica con impacto estimado",
-    "Oportunidad 3: descripcion con evidencia del mercado y accion especifica con impacto estimado"
+    "Oportunidad 1 breve con accion concreta",
+    "Oportunidad 2 breve con accion concreta",
+    "Oportunidad 3 breve con accion concreta"
   ],
-  "contexto_mercado": "2-3 frases sobre el contexto competitivo local relevante para este restaurante",
+  "contexto_mercado": "1 frase sobre competencia local",
   "resumen_telegram": "resumen ejecutivo de 3 lineas para enviar al dueno: que va bien, que mejorar, una accion"
 }}"""
 
     payload = json.dumps({
         "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 2000,
+        "max_tokens": 4000,
         "messages": [{"role":"user","content":prompt}]
     }).encode()
 
@@ -561,8 +554,25 @@ Responde SOLO en JSON valido sin texto adicional ni bloques de codigo:
     try:
         resultado = json.loads(texto_limpio)
     except Exception as e:
-        await update.message.reply_text(f"❌ Error parseando JSON: {e}\n\nRespuesta raw:\n{texto[:500]}")
-        return
+        # Intentar reparar JSON truncado añadiendo cierres
+        try:
+            reparado = texto_limpio
+            # Contar llaves y corchetes abiertos
+            abiertas = reparado.count('{') - reparado.count('}')
+            corchetes = reparado.count('[') - reparado.count(']')
+            # Cerrar string abierto si lo hay
+            if reparado.count('"') % 2 != 0:
+                reparado += '"'
+            # Cerrar arrays y objetos abiertos
+            reparado += ']' * max(0, corchetes) + '}' * max(0, abiertas)
+            resultado = json.loads(reparado)
+            print(f"JSON reparado OK (estaba truncado)")
+        except Exception as e2:
+            await update.message.reply_text(
+                f"❌ Error parseando JSON: {e}\n\n"
+                f"Respuesta raw (primeros 500 chars):\n{texto_limpio[:500]}"
+            )
+            return
 
     # Guardar en Supabase
     hoy = date.today()
