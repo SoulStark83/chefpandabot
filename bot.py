@@ -73,42 +73,31 @@ def extraer_texto(data):
 
 async def buscar_resenas_reales(nombre, ciudad, update):
     """
-    Paso 1: Claude con web_search busca toda la info publica del restaurante
-    Devuelve un texto con puntuaciones y resenas reales encontradas
+    Paso 1: Una sola busqueda web consolidada para evitar rate limits
     """
-    await update.message.reply_text(f"🔍 Buscando resenas reales de {nombre} en Google, TripAdvisor, TheFork...")
+    await update.message.reply_text(f"Buscando resenas reales de {nombre} en Google, TripAdvisor y TheFork...")
 
-    queries = [
-        f"{nombre} {ciudad} restaurante Google Maps puntuacion resenas",
-        f"{nombre} {ciudad} TripAdvisor opiniones",
-        f"{nombre} {ciudad} TheFork valoracion",
-    ]
-
-    contexto_total = ""
-
-    for query in queries:
-        try:
-            data = claude_call(
-                messages=[{"role": "user", "content":
-                    f"Busca informacion publica sobre: {query}\n\n"
-                    f"Necesito:\n"
-                    f"1. Puntuacion numerica en la plataforma\n"
-                    f"2. Numero de resenas\n"
-                    f"3. Al menos 5 resenas textuales reales de clientes (positivas y negativas)\n"
-                    f"4. Temas recurrentes que mencionan los clientes\n\n"
-                    f"Devuelve solo lo que encuentres, sin inventar nada."
-                }],
-                max_tokens=1500,
-                tools=[{"type": "web_search_20250305", "name": "web_search"}]
-            )
-            texto = extraer_texto(data)
-            if texto.strip():
-                contexto_total += f"\n--- {query} ---\n{texto}\n"
-        except Exception as e:
-            print(f"Web search error para '{query}': {e}")
-            continue
-
-    return contexto_total.strip()
+    try:
+        data = claude_call(
+            messages=[{"role": "user", "content":
+                f"Busca informacion publica sobre el restaurante '{nombre}' en {ciudad}, Espana.\n\n"
+                f"Necesito en una sola busqueda:\n"
+                f"1. Puntuacion en Google Maps y numero de resenas\n"
+                f"2. Puntuacion en TripAdvisor y posicion en el ranking local\n"
+                f"3. Puntuacion en TheFork si existe\n"
+                f"4. Al menos 5-8 resenas textuales reales de clientes (positivas y negativas)\n"
+                f"5. Temas recurrentes: que elogian y que critican\n\n"
+                f"Devuelve solo datos reales encontrados, sin inventar nada."
+            }],
+            max_tokens=2000,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}]
+        )
+        texto = extraer_texto(data)
+        return texto.strip()
+    except Exception as e:
+        print(f"Web search error: {e}")
+        # Si falla la web search, continuar sin ella
+        return ""
 
 # ── ANALISIS CON CLAUDE ────────────────────────────────────
 
