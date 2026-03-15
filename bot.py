@@ -198,9 +198,8 @@ Responde SOLO en JSON con estas claves exactas:
 }}"""
 
     payload = json.dumps({
-        "model": "claude-sonnet-4-5",
-        "max_tokens": 1000,
-        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1500,
         "messages": [{"role": "user", "content": prompt}]
     }).encode()
 
@@ -214,8 +213,14 @@ Responde SOLO en JSON con estas claves exactas:
         }
     )
 
-    with ur.urlopen(req) as r:
-        data = json.loads(r.read().decode())
+    try:
+        with ur.urlopen(req) as r:
+            data = json.loads(r.read().decode())
+    except ur.HTTPError as e:
+        error_body = e.read().decode()
+        print(f"ERROR ANTHROPIC {e.code}: {error_body}")
+        await update.message.reply_text(f"Error API {e.code}: {error_body[:300]}")
+        return
 
     # Extraer texto de la respuesta
     texto = ""
