@@ -80,16 +80,12 @@ async def buscar_resenas_reales(nombre, ciudad, update):
     try:
         data = claude_call(
             messages=[{"role": "user", "content":
-                f"Busca informacion publica sobre el restaurante '{nombre}' en {ciudad}, Espana.\n\n"
-                f"Necesito en una sola busqueda:\n"
-                f"1. Puntuacion en Google Maps y numero de resenas\n"
-                f"2. Puntuacion en TripAdvisor y posicion en el ranking local\n"
-                f"3. Puntuacion en TheFork si existe\n"
-                f"4. Al menos 5-8 resenas textuales reales de clientes (positivas y negativas)\n"
-                f"5. Temas recurrentes: que elogian y que critican\n\n"
-                f"Devuelve solo datos reales encontrados, sin inventar nada."
+                f"Busca puntuaciones y resenas del restaurante '{nombre}' en {ciudad}. "
+                f"Dame: nota Google Maps, nota TripAdvisor, nota TheFork, "
+                f"y 3-4 resenas cortas reales de clientes (positivas y negativas). "
+                f"Maximo 300 palabras en total."
             }],
-            max_tokens=2000,
+            max_tokens=600,
             tools=[{"type": "web_search_20250305", "name": "web_search"}]
         )
         texto = extraer_texto(data)
@@ -205,7 +201,7 @@ Responde SOLO en JSON valido sin texto adicional:
   "resumen_telegram": "3 lineas: que va bien, que mejorar, una accion concreta"
 }}"""
 
-    data = claude_call([{"role": "user", "content": prompt}], max_tokens=4000)
+    data = claude_call([{"role": "user", "content": prompt}], max_tokens=2500)
     return extraer_texto(data)
 
 # ── PDF GENERATOR ─────────────────────────────────────────
