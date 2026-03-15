@@ -494,17 +494,7 @@ def generar_pdf(restaurante, ciudad, resultado):
                 ('LEFTPADDING',(1,0),(1,0),8),('BOX',(0,0),(-1,-1),.5,BORDE)]))]
             S+=[Spacer(1,2*mm)]
 
-    # CTA FINAL
-    S+=[Spacer(1,4*mm),HRFlowable(width='100%',thickness=1.5,color=ROSA,spaceAfter=3*mm)]
-    S+=[Table([[Paragraph(
-        'ChefPanda genera este informe automaticamente cada semana. '
-        'Cada lunes recibes el nuevo PandaScore, las resenas pendientes con las respuestas '
-        'ya redactadas y las alertas de la semana. Todo por 99 EUR/mes.',
-        st('cta',fontSize=9,leading=14,fontName='Helvetica-Bold',
-           textColor=MARRON,backColor=ROSA_L,borderPadding=(8,10,8,10),alignment=TA_CENTER))]],
-        colWidths=[TW],style=TableStyle([('BOX',(0,0),(-1,-1),2,ROSA),
-            ('TOPPADDING',(0,0),(-1,-1),0),('BOTTOMPADDING',(0,0),(-1,-1),0),
-            ('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),0)]))]
+    # CTA eliminado del informe interno
 
     tmp=tempfile.NamedTemporaryFile(suffix='.pdf',delete=False)
     doc=SimpleDocTemplate(tmp.name,pagesize=A4,
