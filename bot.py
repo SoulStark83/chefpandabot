@@ -594,23 +594,26 @@ Responde SOLO en JSON valido sin texto adicional ni bloques de codigo:
     })
     sb_update("restaurantes", rid, {"ultima_analisis": str(hoy)})
 
-    # Resumen en Telegram
-    t = resultado.get("tendencia","estable")
-    t_e = {"mejora":"↑ Mejora","deterioro":"↓ Deterioro","estable":"→ Estable"}.get(t,t)
-    problemas  = "\n".join(["  · "+p for p in resultado.get("problemas_top3",[])])
-    fortalezas = "\n".join(["  · "+f for f in resultado.get("fortalezas_top3",[])])
+    # Resumen en Telegram — texto plano sin Markdown
+    t = resultado.get('tendencia','estable')
+    t_e = {"mejora":"Mejora","deterioro":"Bajando","estable":"Estable",
+           "descendente_preocupante":"Bajando"}.get(t, t)
+    problemas  = "\n".join(["  - " + str(p) for p in resultado.get("problemas_top3",[])])
+    fortalezas = "\n".join(["  + " + str(f) for f in resultado.get("fortalezas_top3",[])])
+    titular    = str(resultado.get('titular','')).replace('_',' ').replace('*',' ').replace('`',' ')
+    accion     = str(resultado.get('accion_urgente','')).replace('_',' ').replace('*',' ').replace('`',' ')
 
     msg = (
-        f"✅ *{nombre}* — Análisis completado\n\n"
-        f"🐼 PandaScore: *{resultado.get('pandascore','?')}/100*  {t_e}\n"
-        f"📈 En 30 días: *{resultado.get('pandascore_estimado_30dias','?')}/100* con mejoras\n\n"
-        f"📌 _{resultado.get('titular','')}_\n\n"
-        f"💪 *Fortalezas:*\n{fortalezas}\n\n"
-        f"⚠️ *Problemas:*\n{problemas}\n\n"
-        f"🎯 *Acción urgente:*\n_{resultado.get('accion_urgente','')}_\n\n"
-        f"📄 Generando PDF..."
+        "✅ " + nombre + " — Analisis completado\n\n"
+        "PandaScore: " + str(resultado.get('pandascore','?')) + "/100  " + t_e + "\n"
+        "En 30 dias: " + str(resultado.get('pandascore_estimado_30dias','?')) + "/100 con mejoras\n\n"
+        + titular + "\n\n"
+        "Fortalezas:\n" + fortalezas + "\n\n"
+        "Problemas:\n" + problemas + "\n\n"
+        "Accion urgente:\n" + accion + "\n\n"
+        "Generando PDF..."
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg)
 
     # Generar y enviar PDF
     try:
