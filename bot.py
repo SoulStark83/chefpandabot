@@ -1,23 +1,23 @@
 # -*- coding: utf-8 -*-
-import os, json, logging, tempfile
+import os, json, logging, tempfile, base64 as _b64, io as _io
 from datetime import date
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN    = os.environ["BOT_TOKEN"]
-ADMIN_CHAT   = os.environ["ADMIN_CHAT_ID"]
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-ANTHROPIC_KEY= os.environ["ANTHROPIC_API_KEY"]
+BOT_TOKEN     = os.environ["BOT_TOKEN"]
+ADMIN_CHAT    = os.environ["ADMIN_CHAT_ID"]
+SUPABASE_URL  = os.environ["SUPABASE_URL"]
+SUPABASE_KEY  = os.environ["SUPABASE_KEY"]
+ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 import urllib.request as ur
 
 # ── SUPABASE ──────────────────────────────────────────────
 
-def sb_get(tabla, filtro=None):
-    url = f"{SUPABASE_URL}/rest/v1/{tabla}?select=*"
+def sb_get(tabla, filtro=None, campos="*"):
+    url = f"{SUPABASE_URL}/rest/v1/{tabla}?select={campos}"
     if filtro: url += f"&{filtro}"
     req = ur.Request(url, headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"})
     with ur.urlopen(req) as r: return json.loads(r.read().decode())
@@ -40,17 +40,13 @@ def sb_update(tabla, id_val, datos):
 
 def is_admin(update): return str(update.effective_chat.id) == ADMIN_CHAT
 
-# ── ANTHROPIC HELPERS ─────────────────────────────────────
+CAMPOS_RESTAURANTE = "id,nombre,ciudad,tipo_cocina,url_google,url_tripadvisor,ultima_analisis,ultima_actualizacion_resenas,activo,plan,notas"
 
-def claude_call(messages, max_tokens=4000, tools=None):
-    """Llamada basica a Claude API"""
-    body = {
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": max_tokens,
-        "messages": messages
-    }
-    if tools:
-        body["tools"] = tools
+# ── ANTHROPIC ─────────────────────────────────────────────
+
+def claude_call(messages, max_tokens=3000, tools=None):
+    body = {"model": "claude-haiku-4-5-20251001", "max_tokens": max_tokens, "messages": messages}
+    if tools: body["tools"] = tools
     payload = json.dumps(body).encode()
     req = ur.Request("https://api.anthropic.com/v1/messages", data=payload, headers={
         "Content-Type": "application/json",
@@ -58,92 +54,120 @@ def claude_call(messages, max_tokens=4000, tools=None):
         "x-api-key": ANTHROPIC_KEY
     })
     try:
-        with ur.urlopen(req, timeout=60) as r:
-            return json.loads(r.read().decode())
+        with ur.urlopen(req, timeout=60) as r: return json.loads(r.read().decode())
     except ur.HTTPError as e:
-        error = e.read().decode()
-        print(f"Claude API error {e.code}: {error}")
-        raise Exception(f"Error API {e.code}: {error[:200]}")
+        err = e.read().decode()
+        print(f"Claude error {e.code}: {err}")
+        raise Exception(f"Error API {e.code}: {err[:200]}")
 
 def extraer_texto(data):
-    """Extrae todo el texto de una respuesta de Claude"""
     return "".join(b.get("text","") for b in data.get("content",[]) if b.get("type")=="text")
 
-# ── BUSQUEDA DE RESENAS REALES ─────────────────────────────
+# ── LOGO ──────────────────────────────────────────────────
+LOGO_B64 = None
+_logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logo.png')
+if os.path.exists(_logo_path):
+    with open(_logo_path, 'rb') as _f:
+        LOGO_B64 = _b64.b64encode(_f.read()).decode()
 
-async def buscar_resenas_reales(nombre, ciudad, update):
-    """
-    Paso 1: Una sola busqueda web consolidada para evitar rate limits
-    """
-    await update.message.reply_text(f"Buscando resenas reales de {nombre} en Google, TripAdvisor y TheFork...")
+# ── CONTEXTO DE RESENAS ────────────────────────────────────
 
+def construir_contexto_resenas(rid, nombre, ciudad):
+    """Lee las reseñas scrapeadas de Supabase y las formatea para Claude."""
+    try:
+        resenas = sb_get("resenas",
+            f"restaurante_id=eq.{rid}&order=fecha_scrape.desc&limit=60",
+            "plataforma,autor,fecha_resena,nota,texto,tiene_respuesta,respuesta_propietario"
+        )
+    except:
+        return "", False
+
+    if not resenas:
+        return "", False
+
+    notas = [r['nota'] for r in resenas if r.get('nota')]
+    nota_media = round(sum(notas)/len(notas), 1) if notas else None
+    total = len(resenas)
+
+    por_plataforma = {}
+    for r in resenas:
+        plat = r.get('plataforma', 'desconocida')
+        por_plataforma.setdefault(plat, []).append(r)
+
+    contexto = f"RESENAS REALES DE {nombre.upper()} ({ciudad.upper()})\n"
+    contexto += f"Total: {total} | Nota media calculada: {nota_media}/5\n"
+    contexto += f"Fecha scrape: {resenas[0].get('fecha_scrape','?')}\n\n"
+
+    for plat, rs in por_plataforma.items():
+        notas_plat = [r['nota'] for r in rs if r.get('nota')]
+        media_plat = round(sum(notas_plat)/len(notas_plat),1) if notas_plat else None
+        respondidas = sum(1 for r in rs if r.get('tiene_respuesta'))
+        contexto += f"--- {plat.upper()} ({len(rs)} resenas, nota media: {media_plat}, respondidas: {respondidas}/{len(rs)}) ---\n"
+        for r in rs[:20]:
+            if not r.get('texto') or len(r.get('texto','')) < 5:
+                continue
+            nota_str = f"{r['nota']}* " if r.get('nota') else ""
+            resp_str = " [RESPONDIDA]" if r.get('tiene_respuesta') else " [SIN RESPUESTA]"
+            contexto += f"[{nota_str}{r.get('autor','?')} - {r.get('fecha_resena','?')}]{resp_str}\n"
+            contexto += f"{r.get('texto','')}\n"
+            if r.get('respuesta_propietario'):
+                contexto += f"Respuesta: {r['respuesta_propietario'][:200]}\n"
+            contexto += "\n"
+
+    return contexto, True
+
+def contrastar_kpis_web(nombre, ciudad):
+    """Búsqueda web pequeña para verificar KPIs públicos actuales."""
     try:
         data = claude_call(
             messages=[{"role": "user", "content":
-                f"Busca puntuaciones y resenas del restaurante '{nombre}' en {ciudad}. "
-                f"Dame: nota Google Maps, nota TripAdvisor, nota TheFork, "
-                f"y 3-4 resenas cortas reales de clientes (positivas y negativas). "
-                f"Maximo 300 palabras en total."
+                f"Dame solo la nota actual en Google Maps y TripAdvisor del restaurante '{nombre}' en {ciudad}. "
+                f"Maximo 50 palabras."
             }],
-            max_tokens=600,
+            max_tokens=150,
             tools=[{"type": "web_search_20250305", "name": "web_search"}]
         )
-        texto = extraer_texto(data)
-        return texto.strip()
+        return extraer_texto(data).strip()
     except Exception as e:
         print(f"Web search error: {e}")
-        # Si falla la web search, continuar sin ella
         return ""
 
-# ── ANALISIS CON CLAUDE ────────────────────────────────────
-
-def analizar_con_claude(nombre, ciudad, cocina, contexto_web, resenas_manuales, hist_txt):
-    """
-    Paso 2: Claude analiza todos los datos y genera el informe en JSON
-    """
-    # Construir bloque de datos reales
-    datos_reales = ""
-    if contexto_web:
-        datos_reales += f"DATOS ENCONTRADOS EN INTERNET:\n{contexto_web}\n\n"
-    if resenas_manuales:
-        datos_reales += f"RESENAS ADICIONALES GUARDADAS MANUALMENTE:\n{resenas_manuales}\n\n"
-    if not datos_reales:
-        datos_reales = "No se encontraron datos online. Analiza basandote en el tipo de restaurante y ciudad.\n\n"
+def analizar_con_claude(nombre, ciudad, cocina, contexto_resenas, kpis_web, hist_txt):
+    datos = contexto_resenas
+    if kpis_web:
+        datos += f"\nKPIs VERIFICADOS EN WEB:\n{kpis_web}\n"
 
     prompt = f"""Eres ChefPanda, experto en reputacion online para restaurantes.
-Analiza los datos REALES encontrados sobre este restaurante y genera un informe completo.
-IMPORTANTE: Usa SOLO datos reales de las fuentes proporcionadas. Si no tienes dato real, indicalo con "Sin datos".
-Se conciso: maximo 20 palabras por campo de texto.
+Analiza las resenas REALES y genera un informe completo.
+USA SOLO datos reales. Cita textualmente fragmentos cuando sea relevante.
+Conciso: maximo 20 palabras por campo simple.
 
-RESTAURANTE: {nombre}
-COCINA: {cocina}
-CIUDAD: {ciudad}
+RESTAURANTE: {nombre} | COCINA: {cocina} | CIUDAD: {ciudad}
 {hist_txt}
 
-{datos_reales}
+{datos}
 
 Responde SOLO en JSON valido sin texto adicional:
 
 {{
-  "titular": "frase que resume el estado real de reputacion orientada a oportunidad",
+  "titular": "frase que resume el estado real basada en las resenas",
   "pandascore": 52,
   "pandascore_estimado_30dias": 68,
   "tendencia": "estable",
   "puntuaciones_reales": {{
-    "google_maps": "4.5 (932 resenas)",
-    "tripadvisor": "4.3 (#5 de 120)",
-    "thefork": "9.2",
-    "otras": "Sin datos"
+    "google_maps": "4.5 (320 resenas)",
+    "tripadvisor": "Sin datos",
+    "thefork": "Sin datos"
   }},
   "fortalezas_top3": [
-    "fortaleza con evidencia de resenas reales",
-    "fortaleza con evidencia de resenas reales",
-    "fortaleza con evidencia de resenas reales"
+    "fortaleza con cita o evidencia real",
+    "fortaleza con cita o evidencia real",
+    "fortaleza con cita o evidencia real"
   ],
   "problemas_top3": [
-    "problema detectado en resenas reales",
-    "problema detectado en resenas reales",
-    "problema detectado en resenas reales"
+    "problema con cita o evidencia real",
+    "problema con cita o evidencia real",
+    "problema con cita o evidencia real"
   ],
   "puntuaciones": {{
     "calidad_comida": 4.5,
@@ -155,33 +179,21 @@ Responde SOLO en JSON valido sin texto adicional:
   "resenas_destacadas": [
     {{
       "tipo": "positiva",
-      "resumen": "cita o resumen de resena real positiva",
+      "resumen": "cita literal o resumen de resena real positiva",
       "significado": "que revela sobre el negocio",
       "accion": "como capitalizar"
     }},
     {{
       "tipo": "negativa",
-      "resumen": "cita o resumen de resena real negativa",
+      "resumen": "cita literal o resumen de resena real negativa",
       "significado": "causa raiz del problema",
       "accion": "como resolver"
     }}
   ],
   "silencios_oportunidades": [
-    {{
-      "aspecto": "cosa que clientes no mencionan",
-      "interpretacion": "que significa ese silencio",
-      "oportunidad": "accion concreta"
-    }},
-    {{
-      "aspecto": "segundo silencio",
-      "interpretacion": "significado",
-      "oportunidad": "accion concreta"
-    }},
-    {{
-      "aspecto": "tercer silencio",
-      "interpretacion": "significado",
-      "oportunidad": "accion concreta"
-    }}
+    {{"aspecto": "cosa que no mencionan", "interpretacion": "significado", "oportunidad": "accion"}},
+    {{"aspecto": "segundo silencio", "interpretacion": "significado", "oportunidad": "accion"}},
+    {{"aspecto": "tercer silencio", "interpretacion": "significado", "oportunidad": "accion"}}
   ],
   "accion_urgente": "accion mas importante para hacer HOY muy concreta",
   "plan_semana": [
@@ -190,24 +202,21 @@ Responde SOLO en JSON valido sin texto adicional:
     {{"dia": "Este mes", "accion": "accion 3", "responsable": "quien", "metrica": "como medir"}}
   ],
   "respuestas_sugeridas": [
-    "Respuesta completa lista para copiar para resena negativa tipica. Tono humano.",
-    "Respuesta completa lista para copiar para resena positiva destacada."
+    "Respuesta completa para resena negativa tipica. Tono humano.",
+    "Respuesta completa para resena positiva destacada."
   ],
   "oportunidades_estrategicas": [
-    "Oportunidad 1 con evidencia real y accion especifica",
-    "Oportunidad 2 con evidencia real y accion especifica",
-    "Oportunidad 3 con evidencia real y accion especifica"
+    "Oportunidad 1 con evidencia y accion especifica",
+    "Oportunidad 2 con evidencia y accion especifica",
+    "Oportunidad 3 con evidencia y accion especifica"
   ],
-  "resumen_telegram": "3 lineas: que va bien, que mejorar, una accion concreta"
+  "resumen_telegram": "3 lineas: que va bien, que mejorar, accion concreta"
 }}"""
 
-    data = claude_call([{"role": "user", "content": prompt}], max_tokens=2500)
+    data = claude_call([{"role": "user", "content": prompt}], max_tokens=3000)
     return extraer_texto(data)
 
-# ── PDF GENERATOR ─────────────────────────────────────────
-
-# Logo ChefPanda embebido en base64
-LOGO_B64 = "iVBORw0KGgoAAAANSUhEUgAAAMgAAADICAIAAAAiOjnJAADI6UlEQVR42uy9d5wlV3E2XFXnnO6+aXLenFe7q5wToACSSBLRGGMwYMCAAQM2YJOMSMY4ACbnZDA5SAShnHMOq9XmNLszsxNv6u5zTtX3R9+Zndmd2SAEL6+/9/4uMNy9sbu6wlNPPYXMDP/vNttNcOqv6Y8CIMDkP6H8Eb+PzPgwRMweQcS5njD1ePb3AU/4fW6HfUP9/wwI5ADbmTx0U/+L0x+efI0c9A6y3+CmXv3/2xv+r/dYeJDVNC50AUAEahgLHmAnAMACIuwZWABBRHDKYREBYfbfs78WAERABAQwc35PkalNdxI47T2fQm/0lNz+93ssB0wCJCBCQogEiJiZCAOg91KPfS2GSiyVutTqUo8hcZAk4C0IsHdkPYjMOHOEYBRrpZQRYzjUKpenXA5ygSrksRhJLsDQKFIeQAB0ZmYsDUuf6QSP0J5wvw+dEfvwT9I7/u81LGkceUQFBALgAQiA67GvVNzwOAxOcLnCtZoqV9F5EUEWABAlCAhEiISIGlGAJXM60nCAyCJ1EAQRBBYUYc+Z4bFSopUPNeYj1VyS1hK1t2BbCxTyoEgBCIAwAPD/7qD5vy4UTvkVouyMeRYeL/t9w35gmPeN4VhZJ1YcCzChAk0cAJJSoAREBAREsigGjXcQ8fuj52Ren9kDCWYOiBGYEBEYBIXJsTCLCLAiIgkNlwqqrYl62qCjDVqajdE4ZfwieMQWdnAonCup/7/DsKa+65+g4xUUEEEGQUSizFu5OHEDQ7x7AAdGYLxC9ZTBgyJFKFoDIoiAF2AGEGQARNGEWotWrAkCpaIAtRaFSCSAiCiEHgSsZwYlFi2AdWJTlyQUA3kRccgMIqIIFZHSoAgQULywiPci5IxSYQ67W6m7S/d0SUtRISAACxAzAAghIBA3LPiwVvKUV3z/z7CmcmTwigCAAFy5anf0w7Z+PzwulXIojCaEQLMiEBHnwTFmJz7QGIWSj6AQUTGiXCj5AANNBIgIhEggCIKAwMDCIqQNFQqgDKQJ2FgsZ0ETlAYyEFsZHY8nKhI7qqdSjTGOJbVsvQATIClipUQEUgepYwAVBtjWLPO7aUFf0NkuCinzsQiZT/zfbFhzoSN/EhgBIQIygC1XYctuv203Do1yvQ4kKjBilCCgB2FhENAKSjnVUlClAjXnuRiRIQIRERRByaKmF2IUESQmRABEYkZlDDU3ubHhh2+945F77psYGx2y3or0NJd6WgotEQVRqWP+4qXr1ubmLwBrXbUKpDn1GFvDCKlAue4nqlKrU2wBkFE0AKRpWq2lLByGuq1ZLejBJfN0ZztlqZhwo3Q9ggj4f1+O9Sfiq1CYEQEIPQsKKEUA3nPaPwBP7PC79kC1Lga10VrIC4tz6MUFmpoK0N5kOpugtahyAZAH58F5YBH2gkCKQAeoDSgCpQAVEAoiggZhz6zzpbQ2cNNPf7H+7nugqW3p6uOWrl5T6ujMFQoKvLNxvG/3zvsfuv+uh3bv3t3a037xn7143Vlnw/g4aAXgt27ZvGPb7mTv7rGRfbXRcpuHziifgxAp6uia39XeaYKcrVcTW9ei2Bjoaacl89WCPijmFAB6EPBAgkJZPTmXSf1JGdz/NYYlKOSBAViRAvCVarJ1F2/YoYZGrBFljCYFXsh7K4xaS0sJ57WZ9mYsaUIA54WdMIMoDAwajUaBNqI0YJZAYSOXbhwQFBEGr3OF+6/51R0/v2rescef/dzntM9bOu1LZc8kAIa4HI9Ud+0evPmm66++8YaFK5e//Z1/+9jDD/zyBz9VpI5du27t8iVNnW2qVMyHBm1SGd63df3GbU9sksF9i0q9Z645qam9s16vCYBy3nmRXGjm9cDqJdTXqQCzYvLQpvP/DOvJ1XoIhB7AD4+69Ztl8y5dqflAY2S0IFjnPdu80a0l6m3XnU0q1CDex6kwg1YUGIwiDAxog4Ag4IEbeb5kCKlMIetZVcgIKjI/+OS/TgyMvfAd727vWwAA3sYgAoSTR0NANCCLS9KhsbhuVb5Uraf//YPv/+SXPzrplJP++nVvOPGEEw7xy3Ztf/T2X13xyDW3ndS74jnnnq+tr8cxRcaLc6kzrKG7ndYuU4v6lDEoIMIH1I8Hn6A/9arw/yD+JgAeQWeIESISMoDdN8YPbJDtO8CmZAIwSqyIY1Ek7UVa2B70tFIuRGcljh2LJiWFkHJF0EoIiRWIAHgQyVzAFHYAACgkAAScJcwOWOcKX/7IP0dB4ZXv+gAAOBsrAkBkRJreRxQlKEygvY2HR4eHJzyGLe2dw+PDS5YvAgDvLHP2OiEQyY4nAwggKdQGAMa2Pv7T//7BlkfWv/LSF61s76lt2mW0QaOZhNNUmLm9Sa1cplYv1UEAIiIekaThaLOegPw/wzqyGwOAgCIG8AND7qGNfkc/OYe5QKGCxKL3nAt5Xqte2KVbC8SOazEAuDDAXKSCHGmCycoKZArfnOVnsjCARiRSDALWWlNo/+7n/mV8tP7m933YO4soiLQf1QSaNQsE4NrIRKVcL3S2FErNwpZZiOig6DkDURfxylrw+p677vzKV7986XMvfva5T6/es4HGqugcaZ0aUrFna7G1hOuWq5WLTBABA7BnDSiE//fCDX/0PowoJARIxkbhrvW8eSeiV2HAWkPqnHhoKpjFvXphhwqEk5hjB6SxmMN8nkgLokADCjoEA0GEQQBzOYAIIAUfJ0mqvOhS9323XvOtr37z01//tvOOcCrwzWlYKAgAQh48c2JVPvQshGrWy2XmC4FRECkZHgOHo9X0Ex983/nPOPH5r/nL+ra9sGMf7Nyna4kPldfKJB6st60tdMIKs3yBUgbYAyD8aYCif6KGlR0YYmZCQrL1OH1gIz62QZJEhRGRQutTYO4smWV9Zl4bobhqlb0zQYTNTRIGxCQiIB6nzj3CbMwFAnDsgfJFABna9PjWe+8ZHRnsHxnfOVKtpZ5IrX/ssU998auLli3xLiHSM78jHOz5GnkaMAACEIo0kNvDGhYAI4igEjexd5+zBoPw4+988/Oeeca5L7jUWy8O3Y4Bt3WPLqekjQ8UWoep5a5WOmGNXrKAABwzAcNUR/1P2bCmdz2Pqs8wvTw5ujDKwAKsUQnH6zfBXRukVqFcgEpxmqJnbi3qlfPNgk4C5krFA1OhSIUSagPi4YgvWWFgTcoUdzxy251X/JpTXrBu7fyVa4pd84JcwXu3e+eu7Tt3XPKcZzPzU32e5r6MEVy1MjowITqXxNX//OC73vOut7Z1dAGLLhU4dW7LgN0+YCopGWNDUvXUp8KLesPTjlUdLR4YfKNspD8B63pqDOuo7G/2txUBJEBI9w65Ox/GXbt8PgxUoFKui4WmQrhigVnULpJyuU5koJTnYh5RoQDOyMUPa1UMUcjW//xzn6sM7Dv3pS9betJpB/lNBAD29hBH4Mm25A5lWJAko4MTldiVWlruvvn6xx654+8++F47NEjlugBTsSQOkm0DfuteXXdKBQ49JQkEIRy3Ijr+GNCqUfd4n4EmiDgzw/v/g2EJAAJjRmgRJBJn6/c/Zu57AsBKLg+evU0kl6fV84Kl3cRiyxVUopqbJV9EIPQekLFBiKIj+7GWwnxtZOSbn7x80doTnvPKNwEAuwQEECizbAAWAREhRYdupByNYclBf8xiWGjd+OBELfaWpalU+sxH3v1nr7ps1annuHoVa3UpV8SQypVsNfab94TDEwojALATtfpoeaItr05bV5jXpcMgH+Wm3tUze+81UUbVkT+WL9NzwVQHM1+fhAEd/ObTQTwERC+ChISuf29y6/1qZJxzoVNGJSl6gaW90ZrFlDc8PuHZ65ZmKpQEAZkRBWgqicZZUouszQz7WQPMHk2uOrLvax/+4Hl/9lfHnvV072IEQlIHuCvEwzOmjtKqjuzJiAoVE5AwKH3sSWfeef1Nq047zwubpqIqFG2lCrU4bG2CMzseu/PBm7/7kw1bNo9WR2Nh57mW1KGtKYzyPd09XQsWrDn2uJNOOWX58hWKCACs9fvRtz+axzrYPz0luOih30REkECcr977uNz7SB7FlvLAomLrO1r0cQtMV9GVK5w43VyEUgmBkGc94xl1BQ/9VTw4otyX3vN3Z73gxced8yybJNqoP1ZZcgSGhSCprQxWqh6BhbQZHdh13bc/+8ZPfkQEkdkD60JbWh//7Q9/dM0Vv9q9Z8+Sro6+BZ2h0mNjVSfKeltL0lqlXq/XhyuV4VpVh7klS5afd/55z33Rizt75gOAdVYh/RFIYH9sot8kUVjQA2iyY+Pp9XfBrj06F9UDpespGC0nLQuWzwMbpwMjKl8wvR2gNfip2utQZ7DBpZL9Z7RBzvOsi+03fu+LvYtXHXfOs1waa0MA8oesomTW+vEQz3bWCTOAAkT2rtTd4xjHBgZbevuERIdt1/z6l1/8zGfjocFj5ve+7jnn97S31eNa7PkJ7h+uJEYFBkgjRfmoub1tnnWJ8xNDe7/5+c/+8nvfvOg5z7nsFX/ds3AJC3vHStEfw7AOEfgOmPE4LM961uRj6rUeAVkIwGtKN2zzt9yPNsFSQVhU1Upfizp5RVDM+4lhZKW7ezAKQQScIB0c7xqPCGYNZU+kVBQiGAB18KmtjO7edN+Dr/zQJ9k7pdQfuDBHYA/iQBmRwzuILL67WmKFAQmQ2PsoLEWtbaMj+1oXLatXxj74rrdc88srTll77KJ1a49Z2Nve1jwyPoYIsZMktYqUYw9KKWVEwLMHYK2wpbW5paUpidOf/vCnV/z8Fy99xV/8xRveasKCtVYp9cfwWHPlWEeQGMx45nRDnPGHAACQB69I2Me33e8efCw0WvKaai5Roo9flFuzhOOq3TdoSi2+rYSM4BkQkOY8M1koV7lIQQQ8Mbj9iT1PbNuze9fQ6L6B0XIKqlAodnX3rjj2+OF7bzzm5FNNocRpkhVQf9jwR2TrTpNQGMhhnwtoy0k9dgmpDEkHBESVC8JiMerv3/PKl/3Flo2bzzn5hKZ86F3S3FJkmwaBqSZ2256B1IsACIpH8SBKKQYxRrPz4kXEI2F3X08SJ//91a/dcvW1f/PeD518xtnWWiL6A6Vdf7xQmF2UrBTUapXrbtfb9wSFnCBi3bmWfHTKct3Z5MaHgdH0dEuQJ8d4aNycWQAo1wwgm9Y/eMNvrnrs3nvSfXuDlC1CipR4qTo3Uq3WYle1/uz57Z/52c9FGNQf5/eid+ziWtTWhDqYiskHJAWCQIiuUq+W6ylqyKwKBABTG7c0hbt3D7z2HW8YGRxZtnhFWrdJFKZIO4b29ba0jIxXhkYnEmYBTL1zwtZzA6kVQSARjxn6qsA5q7Xu7FvcPzT6ple+8k3v+qdX/fVrnXN/oK6dPvLO4AGsDNzf6DjMN8vcFQuTUm5oOL72zsLIeNIc6QS8tXZpd/6klQieB4axuQnbm4EVsYcGe1MdlAIjAHrvVRiiCu+4+drvf/ObW9avb1JqXkd7W3cvaZN6TjxYZwtp0uQ7refRoaHFa1aZ1l52HlEDPLkGCO93MQcek6lIPZnYMYt3dZvasYmmjg4UBYLSYBwDAAkyIBNAvVyrj1VS0YBIIhl/hxEQZHRo4CNv+c54Oenrm1+L61IwwOxF79g7sndownmPSGQCxy4VZi/MwsLCSGSctfvHHIWIAs9sOS02lQqF0qc/+uGdO7a+7/KPOOcBnnpo6Y/lsViUVsmm7e6G+3KefSGnYucA1AlL8uvmw1jN11LV3Q2FiIVRfHaO5vqt3nuVb921fct/ffKTD9x0/eLerpNWLBME77nqOE3qLGhZEps69nHqETBO4ra+PgAU8UjmyRkWyuSg6uHOAgGy9UlsRSit2/poJd/aLAAiqhH5AIjRx75SqVbjxCMhEDAASmMSUSmIyz/9zTV7hsf6+hbE9bgQGiLlBazzgVYxC5FiEfTes3gGzyBCnhkRCUBECMmLZ2GFSiGwCAGyZwFavWrlj7797fFy5ZP/+ak/hN+aM8c6jAeaDa86OEub8jWsKXlwg9x8n4o0hAFb56PQnLLKzCv6PUNslF7YKzpE7xWAIKPQIfALlW/7xU+//+V//2RfPve0U09OvE2sTRwLkBdJvXdeEMGDWBFhJqWZ2Urjuwj8Ho0aFu+9CtUB+SciZtzAhu9iSCp1az0hJIl1XBWRXCEilSGw7FOf1NM4tpaBUctkBGzMkDEXmkr333X9tj0j7T3z0iQhpZEQCb2A9RJbR1o3oDonjr0TJiABAFIIyN41oF5ERQoFmTP+EYEIe0hssmbtMb/68U/yxdKHPvzhNE211n9Aj3UkCfuUGR3eFsULKCSs3/OQvmM9FyNApLpN2wvRWet0XqcDg1QsBR3tIkDOAwBkMwwHd3kRxQuSwjD/bx//0PU/+8k561aHuXCiUldAShsNnDjPkk2ievDgvGvMiIIw4GA5nexNz8GfgamewCxYACMQKEKw9YqAmCjHGTkeMjZUg0qBBAhYL1dqtToQsPdDu4c6588fH61VxmMTECGxsGfh7G2FQJAQBBv2TsIMEoi/4kc/SlDnPKIgsOhGUsGWEZwo8VOIvfNOBERlfgoYwXrPGQgtQKQAkJBR0HnPCIiAApVKefWqld//xtcXLOz769e98amtE/+QoVCAURFCfP0dwUObpSkHBFC38YL2wikrhHw6MkrtHbrYBFmvF6fjCLO4CtFaSP/T37115933XXb6ySoAFeQUUrWeCqD1qVKEBN4yIrIwIbG4LHQaYwb3DkockwJUc4HFDrKpm1mjmwAhpHGcxql1IoxBlGOEjLiH0sjGXeoq5XJar6MAi7jE7xscbZ8/H4lSkdR6RCFCygycZzFx69Pmzr5bfvnjG2+8LuxeyM5pQETMkCdGFBF2XnE2jQhE5L0Agrc26wwiojSmMJAQp4a4swqaiADQO5dlCEsWL/7kRz9+ykmnnXDyydZZReopNqzD+qqDGzWHfnZ2fVWvvVU/tFlail6xrlu3bF7xpFU+nXAT1aCrG6OisMcp3HzqnWf+XxFhQdLBe9761n2PPHLhmeua8/nmUgEVFqLchl39LnWTiSsAIXLDmyIiADNLIZ/fvW3rvr3Dre0FnSdGhQf5KvQpi2BYxMkSbn8XT0CcT6rlWi12TiYGhzq7O+NaNYgipRrH0DmXpKmNE3EeEKz3QWh27hnyHk0UpElCpLLRx/0dOwEkFGkM8IuIZ2lu7dp0+3X/8tH3+2JHKJrBCWVeTJCUALGI814pERZEICIi5ZwlAPR+qvFMRMwACDyZQmUHBQEEkYiISLwnVK2lpvf+0z/+5Je/NNo8VT1iOhKrkpnKBUcQBFkARaRy0x3hYzu4rUmYqZ7w6gXR6cdwbYIrtbCnF6M8sGvgCdnwMWLjfiBY5VWu6V8+9MEd995z7rHHNBeLbW3NiISCIs46lzI7ASfimb1zyEBImMklCIhIlM9Vx4YffOA+z1E6PkrggQCQEAghm/PyznmX2OroaFyt2Di2SWqTNK3HyUS1MjI2OrhvfLycplZpNTY2vmfnLkKYGB+dGBspj4xPjIxVxsaTao09M6K3HgnqNbvhwc3lajW1qdKaRRoDQIKQTexTdqzEs0+FdWiKpfyDt11z0y++P1yNMSqIdSLinUcAROUde8feiXOSWk7SNLWptS611jqfOFd3aTVNavW6tdZaOzUb0qioszMniICKNKFCJO+5q71r4/rHv/m1rymlmN2fbihkICIpX3Nr7vGd0lIU9ui8HLckXLdUhoc9ejV/npDBjFhxuG6v917l23/4va/f/vMrn3n6cWy4o7XD2RqheFS7R8p1jwzsvPcsk3Vbw54I0YooIhEslJqv/vE3zzz76dU65Nx4FBplNCgtIuKsTZKJSjo2NtHZ3lKemEBCzHJhAdx/UWH23L6+vjtuuUMHUe+C7rhe9+yzn40CHr0IGKPjSnLnzfejCpMUHrr1kWOOW5VvzgGp7BrVqECAFAoSAWgC7/3uTRvuvv6qh267qWtxnw+i0As3woNMURXSzP0AsPMsrAwhe3bWe+/FE6JSGrX2IAhAUx5BgLMJSiREQCARIaUUA4uPbdrT3fPNr33tRS95WUdHG7OfdG1P/qY++MEPTvdDs7oinHabq06cVgMKElWuuz14aBO0Fj0KJU5OXJ5bs8gODxMI9fawNirj1B7ATTjg/RFZUhUVH7r/vk/84z9ecOJaz76ntzvQCIykzKa9QzuGxoDAOyeCXlimHcosarM0kl4Moh1bNnYUzJrTzx0dGfOpr9eSWrUWV+v1alyrp4xqaGi4Mlbu7Gq3aQKMOLM5KSLsvTI6ju32J/b279iDws0tzRQoUqiVIk2EKo3ttk277r9nfb6lZfVJq7t7up2ze/fucfUEEQOlFCCjZ/DO2aRan9g3sHn9Q3def9XO7TtWnnDOs57/0rvvufvhjVtz+ZxwY/peKcoFRhMysGdx3ipiKzI4Mrp7YGhH/949Q/uGRkYHR8aGRsecTQOjgyicjDbMnIU4NZWkCCA3Jt3QMWtjhnb3t+TMKWed473L8rCnkt0wV/vviJgLGTSoqHLn/eaOR7E5L8KYeD5pWbhmvgyNe4W6px0kS49lGullJt1l2mcwOIu5N/zZy+ah7elqcaJWLJ5fCHXseMvA0JY9Q6QUs3cenPMskunCiAh78ey99wiQWs/eOy+x9bo68k8f+ehxT3/O8NCoQWbARl3H4r1TSj1y78P5SK89aQ0gWmuZM8ASAUQIjTb1Sv3eOx7p7uxr7W7ZsWUTO9dUKuaiCBG99+WJyvDoWFAoLlm5vKOvLanXfOK1Dnzq4lrNs4RhgIjAaZqm1Vq1Up7Qyjzx4J2Ua37Wi/68MjYWlppu+PmP/uNz/xU2t0CcePAsoLVqK+YChUYTgmijh8aGd+0etA61CZRSWZADEec9c2xQOtvaF8+fFxiTWo+gGwpyWfYo4EWscGq9ZW+dZ+ZKtXxsX9uXf/4bCSJk/j0ZEPqpKwFBRFBRfO9jwV3rpTmfElA9peOXRKsWyNCYD1TQ0Q4M0siVD39NMHvKtf/461/yQ7sXnbhuolYXwMGxcqDN9sGBwYkykW6EQEQRJsSs/8rTLglmJkWWJfGpU5BQ+MH3/NO73ls9+5IX7CtXrU0VEAkCMwraNFl1wjEP3fvo9VfeuHLtytbWUhRpVoaFnfX1SrxvYN/g3qEly5ctO2aZyatjTlhenahMDI+mcWK9I8S+JfNLrc2l5iYG7531xXx5tFyp1JXCYnMJgbz3LMxAQRCGpabW7r4o38KIWzc8Xo/raZyEUeqdhzjRzZRoEte4gJ33msg51sZs3bFr976hQq6pUIgmkQ4AECQKiTyG4t3ewfGRkYllS+Y3N7VyI6Y2cOfMqzMLgyCSiGPmIMo9sXXHpvWPrDzhVC+MqP5IVeGh3RiygKL08c1464O+KWQCXbdwzKJw3UI3vA+VCTraBREPXXTMpE6gCcujA1f94PtrFi+o1OqOERF2Dw5XvbOWFYVOOMP92PtGAQDCLI49AYmIc84zAGkvwqi9SyAoTKT4D//wD694+KE//6s35Nvba7HDxDEiKjQmSKoJpGJ1tHn7EG/aFWkkcM47QIwKpc7ergtPO7HY3gwZAgm20JovtDbNvMQ8ewciSpNCbOtoAZRqJQYGzhSRBASUAHsWEV8vj+aaWm2aorNaR3Fiz7zgwnvuufPmm2+UXKTDgtIBEWd4gTZq2649A8OjrU0dAiLiM57QVDLCmQ4FKpOPnPfrt2xdsVg623qSJCFsVA7ZxJsI42SwEmEDqj/2N994w8oTTvUsmv5YyfusODsKeATywJrswBBf/4DKKY9IdSvL+6KTlsPwqGKGee3gs3YFzh71DupYe+912Hzlj74q4yO6r6fuHCptmR1nykPiHDOhbxyiST0qImMMsfLOCYtWilBS74U9iWihxIlTJil0fPYr37r+2psue/ELz3z6+U1tXcze1dJd/XuHhoZ7uvtOO3FlW3uRrU9qsXWOkHK5KF8qAiIAe28JMvlHJV4E7P5D1FAqIcjGUwmIsKm1FCeWnRAhs0jmXX12hgGDKDIBsBALKfTAQaHw7n/+8DnXXXXt1b99YuPGfeOjYaFUjAqk1GhlfHB0X1t7VzZ3KcwAjJOQ8uSp4UwsDpRRiJu37YiiQi6MvBfPjYlcFmFAz8wiIAhIjpmC/J133f/aBtb1FDFID+uc5mjgCDMAkZTLyS9u0bVaUsCwZt289vxpx0Bcsy7RvT1IerK2mjtVnx4EERDAe3nti19SYlvIF8Qoo3RbS/t4rTZSnuBMGY2UtVYEmDmT+yxXqqPjE+PlapJYZlZK5XNBS1NLFORiay2LdVKN01qSMGG1HmNc7igEl5x3wUXPvGQoTVrbuxctXdnU3tzeUqJwCpFRDQyFvbAgzjkFMwOUyXqLjWlYGN03UZ2oZx6Cmb0AeE6Fw6hgyyPXX3vtquNPXLBwYZLWs1QJSZVKzcr5XVs33XrzdbfccO3Ogd1Nba2bt+2KPYQUehGlVBAYo9E5RlSIDI3Sr4HhOS+E4FzcXIxWrViV1G2G82U1jRdg9sLiPaTsrHgb22Iu+uVvryy1tHrvfx9ASz+J2DeD6wdACOJc9drbTWVcClEUO9vWlD91Bbsy12M9fx4ogw06BxyIf87x1ZlZh8VH7r119+69q5YuGE9S4qCtuViIotFyOfWMDQEiLwDeO6VoopZu3bFreHQs9QykiYyIiNih8eqOPfuaS8Xurm5UKnXWMyMgW1cMSZW6tw8M3bdp6zs/eG7FSaDRJpa8w0BlUzoiLiM1ZCjurMyw6edy1qsUEcMwrEF9us1RGDaR3vz4Ixseuuv440+a39cdV4bzmrQmo7XSoHyFIn38iatOO+v41/zNq2743dXf/vLXwjB3wvHHdbS0aqWGh4c3bdy4d2BvqdQ8K0mONAh7o4OJcm18YiII89Z5FJTsQhQQZmZhEQAB5jAIRkZGt27detyJrb8nUqqffK6eJYIMoqh8y71q14A05TG1ST6IzloDyLZcCfvmow7BO0A45CDNQZ1BFgB92213eIHYg2UILQdRbjSJ902UHYt429Co9Z4UDuwbfuyJ7VbQmDAMlGSjwZkEow4c2+FKdbS8aV7fPCRtnfPCaChN4nRsfO3CBWvm947tG9AtbUk9EVGBUZNMEnwSiA4eJNUNgIREiI6dCOog1IEZ3rHjiXvu1ZFc+PxLO9paSPsg30EmIACaUv5A8czeS3N716Wved2Jp51OUTh/0XwwBgAliXf17/nR//zwi5//KiI1YJZp7QoQaUjpAI5OTHS0hd45IILJaZFsZBwbrG5Eo9K43j+49zgRYAF66nKsg0drZnzR6YYgKMCoVH3Ddn7oCZ2PVMoWWJ+y3BRMMjBoOnswzAF7aJybGTjCtFA4y5kjRID00Ycfy+UKSSosJOIHR8esc9XEZrCZByGBUKmBfcOPPL6JgrzRBrzHybnNRsdAmICack01l27rH+jp7rYA3lk7Ntbb2f68F73kBS/9i0cfuGdwcO+yrp7YOkFg53Ea6eqo6hhs6JdO+3wRYLHOiVI6bzB1Q7t3bduw0bv4+KedtPK4Y0GREGJ2LkTYW2aHHgAYhAmVKBFmLo8vXLUKgH0SSxILswmCBUvWnH7GGV/60reRCNhPDfNlfyCjCHgEQFUp15oLqfMMSiMCkSJFwIAIXpwAZmQwy27wocfhomd7BMqiOf5+hjUX6WXWxxmBvIBCOzrmbrk/CjSgci4JTlyu53Wke/eqllYqNbN3NHfddyjcVimOq+Xh0SCMLIv3Xiu1b7wiAoHSGXdUAICoXKut37JVR8UMWTjYeyuF9ThOyjGTqtXr/d63FfOFIHjBn7/80ktf0tY3zwLqMBobGSNBQSAg6xwcZY087aqT/aQiZgFQSqEibZBtvHP95oH+XcV8tO7UdcuPXQdKi3cCICworiFxiwJECCJCgJTxs4AFSfski8sEIkpHu3f3/+e/v/uHP/mFZ88eAm3yhYJ4v7+0yuQmEZmonlgnCEgCmcChsKCIEs7yQPbeK1QU5mv3PgY7+mFhHzjPqiFL8UcKhZSlyt7HN9yt04TzCqopLO9Vxy2UwXEMC7q5ldnTYVo2ONdJQqPLw/vGR0fRhKl1nj0DZY136yWrLpmFELbt7ndCgTLCfganCQQRmHl8bHzRwkWr16wpNRdq1eqGxx5bt3jhm9/xzt6lq8oT9dHqRC4Xtbe39G/bXiwWqi4F79O07p0lE4AIyrTZoEmodNqUxrTRrgxQEiYBJEJjCAhA6mOj2zfv2LllS1yttHS2nfOcC7rnLwIALw5dikgoQNNPHxIAi8IpvqoAIDUKJhIW8SJIgIUo98q/eMWrX/XagaFdjz72+DVX33DvPfeH+WIQqEn5OEBEyeSbhVkYEb1jACEmIGJ2GWNVGnQjYEZTjOD2hyWfw/ZWFodPCoLXB0c6nEP0coYzYEFF5bsfp/69Uirouk3b8sWTV2G5ysy6o1PAZ4dibsPCaftDDsjfBDEYHxkdK48XWroJHLMgeFQgIqIaCyIIcKJa3jc2HugcsKdp5WrGFcje7O///h2ve/ObWzu7sg5bOr7PJzbX1ZPUKk3NTYl1SZK0FNYN7Nh205W/WH3y6YWWVg8sXmGgwDsGcegBhAQoM7NJa2IAJZkUDRIhIE2Wi+KT2vCePXt37Nq7a3e9Wm1ub1+xdu38pUt0FAAAe9sI95NVvcw4LggZRZkAeaq+kUlpLUTUIOzFtrS3t/T2geBaddL5z73sjX/7xp/94Kcf+vDH60kaGLO/3hfw7AkpMzKETG0eRYAZhIURWFCjEmEA11Zqg9TWb7rDPO9CIv3kFgbpg83oEMOrkwR2AUW2f6/c/TDmc9pKajA4bSUqccMV1duNhDBrT+BIpcwBAOu1Wr1eL7aCdz6DRZxIxkTLoh6gqpTLzF43fsJ0MRIgUtVK9dTTT33XP18OAGlSyYKKLjYFJbQuCfIFFMxNMscu/evXPHDbrffcfk2AQXNre8/8BX2rF0eFPKkgAHOY78u+XqnUxsbGhobHRkcmxsfrlSoZ3dHXd+xpp3XOn6+NBgARx85mxeWR5G1ZXj2ZkWT0mskeezZGwCy1umePzMhOR9FLXv36NasWvfhlr/E+U3bL2rjAKeeL+Sz3IiIRyPYdZPl9Q9VegJEKSnc3lyTCaM9w/Z5HCmeeyJ6fRHmoj7LegUZL19r6rfdFJIJkOTXHLo26Wt2eIWotcT4iy7//rG02+ue9b4wHCKBSWWbM7JgFCeI4ydr1Mp39SYQgRJQr5O64447XveLlf/v2t61dt44IEAgseMWaFHgQbKycEAATRqed90w477yhXbsH+/uHRvf037AFPUdhFIQRIBJREKg0SZ1zTI01Os4zMztrk9SR0mEUtnR2zl+1qqW9LcwVJu3Os2NADw0qw+8DOwKgyvwxIgAqQgFF6B2Buvk3v31s08a+BQuLpabhsQmjdLbOQBCts8VCAbItQJPegUUaPP5GoQGeOR+EvS3NnFouBvDoJrdkvu7p5KPHtPSRtJynP8ICRJjct55Gx7mQpziFnrZo1SI/Oiah1i0t4rIsYS4XdfjqHREBbFAqetI2tZO9MC8IHiQg1UBfMFPaBgY/Y82bQrF2fHSita353Ked2d3TuWv7ltWrl2MQIgAqnFT74Blbmjx7cYjUOX9R5/xFjR9rkzRN4nrFJdbVE0Ffr8feWWOiMAx1FJooZ6JcEAQmCA9Y1uTZAWeEw4yAc9SwRbbaKQNNUBqObirKZ4iBEJBoUMTi155+xgOPPP7WN73da8o3N/m0ke2V67XABKV8wTNPWRIL+yx/b1D1hRQlE+UFSxf0Pe2U+L4nVBg5svU77i8+5wJQKBk3+/f3WLNaqAdRRMnQiH9og4ki5TgOTe64VSyp1GO9YJ7fb1O/34XpXVtHe1TIJ0lijJ70RQ0KSMa1AgRFqlEJNhpeQohJeay1ufDGf/jby17wwqUrVkDYDMCcJlkuBECziykgEFKWAE3laqR1ZIKo0HT4/jtzhrDjJItoegr1FN6mieo2PqvRgWVo6+x8ywcvf/rTn/7ud7/nkSeeKDU1e8B6krB1i1csISLPrsGZYWaZigSUtaWJVK1Wedqpa8OTVtR27Mnvq6vI0J7h+iOP509c6z0flc86ul+uGETE3fkwcSqE1lm1ar7qzMvwGLS3ow6J8cmO7M3IxLx3xea23vnzavVathRHBLxnnzW3GiQjCYIgyzumcPy0Xlu7YulPf/mzd7z/n5euWOaTNK0O+6SOZBAVAB32J+MkbbdB5/KevWVv2afOJ9bH1ieeLbMD74SdZEVXgyKc4aB/BEmXzBVmvqyRVIqDdGL4uLNO/973vvPi5z6vMj5eTerWuWVLluSiiEUw0xiXBm1tOoSLiNbZoBi85JzTYXQ4d9zyVCNaDznFD6x3wyNKqaPiKdBhgRmZTPCynD3eslN27KYwJ0nCrYVgxUI/OoqGqFQAz3OtTBNAgWy7G8qkx5CDXAeiyu7CAhitO3ZttV4DVI7FsTgvznNqvXXsBVPrgiBAEXaWmT0zew/iPvGpf1+4cs1o/w7rPIaBCvOoNRALiiALuskffkRctgx+B0RE0qAMaIOKpvaRHBkrBI8uEOL0r5cZECMwTgo8Zwk5Ng4mCTToEoq0Dmwtbe7q+di//ds/vecfc6gWdvUUcvkk9QCahbyQ8+iYPBOL4ux0sCjSQ8MDZ59z2pKznx7v2BW1FmjpPE6taKMSW7vzEZlch3eENSId4Q9lBE/orIU7HlVaiQB4DI5bRmilVpXuDhT9FKpsZBf905/+NOe8Z/aTbsp7dt459p59ah2QzheK9ThBosy9m3zhTX/z5ne/5W2JBDpqQZVHVL+nC9k/44wNY/qTuuGMrAy1MYCkw+CvX/+6z//Xp5oL4djIOAta5+y0IzlFCwYEIbTeGfB//9a3SDGPxWY3OpY7Zr5vKejYci6iLbvTzdtIEWXbH48I6TxgxeNkIwIb3bZMSxwZRAPaBzbx+BiGRhLHS7pNX4cfHcXmFqXzAu4pVIsjIvH1M888e+GCBdVqlSZxhMyTO+bUOceSWt/e2c2A3jqlldZ6YmRs0cLF7738oz3z5jF4of8DauL7OzlP6oVHfQXuNxGcJPGJ0ppRnvHMZ/7bf/7nkr7uytiwA3HeTw+Ck1m8qDDYsWPr3/7t61Yed4KvVIPuXmcTRB+sWZQQKyEKyd39oEutKAQ5IjVkmovJPskdy9BlJkBXrvnHNlI+IC+SM+G6JVKro5BqbgMWQmpMceF0VgzOHXSm/mn/veESEAC1ty4qlF780ssGBvZqHTjHnrMhHPAW2CE7ds5ppJ7Onoly1TFXymOXXvKsb/7gR62d7S6pK0CccZ7oyCPgnFn6bClkY7/hZJcQp53pw2quCTIKC3tmR4pIEYv37BorBg6bZyFOHTQkBEVgFCrKOoT1erxk2bJP/Nu/nnDMqomRAaQGms8EHpidd86SDrZt2viS5z/9Le94q6uPkyIIyLS2utHRcGG76e7ANIEo0PvK8eObgfAIe4dHFArJIyOm9z+OtToqStnBqnmmKefHxqmtdXIR7lPsGUgp9skr/upVPfO7h8dHGMR577y33jlhxz7bNZmkNjTB/EXzx8b2nXvccZ/64ueJ0CWxUjoDCOFP+5bpvJMOlY6SWq1WnlAq1Do6Ktc1JevasGillAl1EOajnDAXO9re+5EPnXPCSbV9Q9zoDTILCBkivfWJDRdfcOZ/fO7zfnIClpmxuRkFuVrVaxc6Q0EqnDP84BO+VqMjoyzT4d2viCiSkXF+fIuKjFjPhTBcMc9PTEBAVCiBHDjLMuts4FwX3FwjQIjIzja3db73/f+0Z+9upbJDIi4r0sRbZsvgGBxA4PjctWs/9cVP5Vqb2aWKDloC/seNgwd3LA7xfET1yH33/u3LX/GcM5/2nDOf8ecXXXLH9deTCnla0Jk2bXqowzitLURIWufCYltLFIStzS3v/8jl5519lhsZdczOeUGYqE5s27bxDa9/1de+/U1tNLqGXBYKCCJ2NvnRcdNagMVd3lrWisYn/P2bmfBIOvT7x78O+g2AgExADI4wveNBGByUKIA0NccsMb2tdmLUtHWgCaQxx4zTtEDxoEpoxoPZumXJ5kZwzqqJiLxL16w7cXCo/6Ybb2tv70ytBUT2GZSVoXzeSxr69FOf+czSU0611RqZgEgJKdhP9TySmgwPEQEPXdxl3ZdDUSOnPTRdZTCTi05r8Xe++OUFSxa9/DWvvuCSi3Klwi3XXLt23dqmtnaRme2UjA3eEHiaUV3g/oXCk5UbQkY6DoJAK1RanXHmWbYysWfLeqUorlTm93X8+2f/46/f8HpwMTCrTFlZGhEIwwirNfCsW1vj7QPGCxjtRyZg1UJjAj4cDRC997MejoyXrbwIUTpRTn/yOyNemHxTULjwZKjVGT32dpOjI8NEcebhPVJpaG5MjMqr/uJVN95w66JFi9M0lSmiB3si8ePDH7n8ny977WvS4RFVyCsTMGRY6MFvdpBnPYJ+gMxtenIQiW1WctsMwzrwEWYWpYKZ5Z2vjo/nm0uz+obsHWjWf8lWY8j+Pg14RgEE9tZWa4mN6w/eey+EJWfT+2+/5t2f+Li1qQY8aMGTCCmJa27PYNjVWb1/M23YY0sRjdfotLW5U49j7wkPpQlLh2mCCjACP/AEJQlozd6rZfMwIF+vq6aWyYmQPyQIiIjASqmvfesbF158/pbtW7UJSRlGcuJFqcrY+Auf9+zLXv7n1ZEhnQtIKw9yaJNlZmZGIhE5+Lp6cuFv7jCHh1FtFSBE5tTaunN15+o2rYtIoaV1rtx9zslhnPrPfumKDGf3zKApiEIw4dpTzlywcNEpp53V27v4Sx//iImaZGbMbeAWHlSUpyjwlXKwqs8VI+1B5wK/frOv1QmVAB9d8j5VLRMza+KJqtuyHaMAHEtrwSzr44kyRhHmcsojzkIPnQ0axBl3mbqmjsi8SLzLheYb3/j6q//qL7Zt31StVYMgIDJpUlva0fqGt77FOh+GeQhCQcJGMXjgPRtrZmGlI6UjYCYVapPDI3O2OFt5OC1t2B/mD+ZIznj+QRO6AIhCWmlFWpHW2oCAeA8HJgozXiqNWa4ZMFZDoSgr3aiRyINRgOS9KKJcGGqCfD4cHx255EUv371zeP3dt1LUzDL1cZNrQUGEhZqboFw2pUjN61D1xIdKV2rppu1IcOh1MHTYK9E+sZXqdVLaA+vl83SgsJqo1uZJnsMRw87TDo4cZd8HiYQ9ivv4v37yy1/5QnNLYevWTZXKhKtOvOav/nLe0uWISpkAJhWhZp7Nxl0QnLBS0aP33fv6l/7ZhcefdumZ53zni1/MErY/Opg58/jgTNPZb0JzJ6GzX9CzPA0VkTFaBwCgNRmjtTE61I7gwksu/eUPfwqTO6VmnBYUEcZc3keBK1fCxV1sUDnh0MhjW5y1dEjBIzqEIoOQliR1j2/RgQZmLoTBwg4ZL4sxEEVwBDLT0xCdI3PmhwgxiAjg0+rzL3vBtdf97qMfv7ynt+OkVSuf++cv9s7rTNTnkFk4M2sVXfOLX77owovTJH3DO9/+hre/LZ/PW5vgk2qdT2HIBzv8uZDSp3b526Ru5cyAMPOwN3qpCGiUCgPS2gRKK1RG2Vp95QnH+9Rvf+x+FRb9Qchn9h7U1uomKqol5N42SawEGodH3ZadeMjycC6ddxEWUOC27qbxMpciiK1e2q1yxo2NQVd75kaO4Mo8OiBpeuyAScbf/oOIRIpSWwuNfv0b3tBeiuzIaKm3z1fjaeMoh8BMVHV89Fuf//znvvHVCy69dNq/WRF5csn7XI/jkb3wyEDZmcfz4I/CAxonM56PlBGvBFgIARViEFjnPTMikQ7XnXDqnb+7ZtGa0xhrarLanCrghIEKJdLDPknM0j67e1h7TAPE9VvMyiWEjcrzyENhRrYVt2mbJsUM3iizqIfrNSSF+bwIT/ni2fDoQ/zTER5OlAO3mDTeTaNB0uXxobuvufaC51wiiSNSQIhKHYKm0tiPQ/IvX/rsBZde6lzsbN3burP1J+1FGkypg0B5fJK950NA/TJbCMTJOZoDcskDXtPooFNjRlIQVT6XCwMjCtJqfe0Jp2zdtC0e35PFylkiKyrV0urGa6aj5NvyknoVBG5gyA6MMBHD7PUbzR6eRBDR7hvl/kGMjKQeult0e5EnYmkqIGo5Il7AUbirIwyOACDekjY3/+rXi5cs6lyyxLsUFIGiTJLgEG8lLPlS07zFy52tKyKlFCl1JKqbh5Zw+pOD8g+CnBvNpUzybZKrkcvlosh4n7a0tzd1LbjvjttRRxkkO0NxnQCYqdCEwgKpXtztgQmVZnEbtxEAz3Hp0OyRm0EA7BPbyDurUSEGS/oyfQQslYBFzV7Qz8zTn7pm3MzoTezSB2+/85kveL44RyYAoiNcoSGe2SVzGJPMMtUxJ8HnSbicI71nLCVpTJI2uEaH/AKHqcsbsZEQSGdOPSsZoygMI5N6d+ypp91z+50gbvZfwIBaq1KeJyphXyfkA++ZAu139ks9JSKe7YsdKBUpIiDsCV2S2u27MQwo9dCS0z1tPFaFXKh0sH9O95Dgwqy2d0A1foAzmOsETnelSoX9mx5va2tZtvpY8JkCBmdMSpJD+xWZe3vKwdYz7RHhxv2gM7kfR5jl3D4Zq2L24r1Yz86zd8xWvBV2Ih5krrb0LB/eEAKckpdpHEWNqAGRkBShIszlInZ26aqVE2PVvVs3URgdNEqDiCzisbnEdUuRwt5Wtpa0pvFqumcPAwJPG12Txp0ObnIhAxD63XtorIJGe++pu4NCzfWaKhb3q1YfLgE/RCtt1shyWGGShhgw4OYH7z/mhONBR5zlpFkv409j3faTC5oZVRUAlI6UiVQQaRMpEymdUyandEQqQiKeNut8hGXQ9JwEs+sKMRN7VhqVxiDUUa6wYPHK6357NVC+8f4zur0IIhDlMDK+VlELO0krh4DIbtPOzPnJXFXhTCIHaoDqjn6NolisJuxrh3odFUI+DwyHQkN/j8rnyAAtBJChHTvPeuELsxQfGzK2fwgkCg/6gnLEv/kovg6zVzoApUD89s1PbN+2eWJkJC7XIgW5KIhKLS2dXe29PR1d3TrIA4Cw894rUrOBWIf7dEJQDeYrIQZGe+et9yeeetr3v/ElH4+RVjBDSkEm2QqKmwuwbzTo7PHNBZyoQ2h47xBValzM40HmrmeRRiFycUK7hyFU3vugUFAdJRkZoXwOycghrhjEIzmiBw4tTq0hPPyFLqR0bWK4Wql1LlgsLkEkmYq5OIPQMJdYyhGLqOBsVjJXJJrWNGyQuAXg8CzezHsrnRsfGbjud9fddP312zatd/VYWIiIABQCEgWBCfNRc0fP6mOPP+Occ447+WRtQs5Ev2YUwjiXZTdGehpK3CAkwl4YCVWgjU3qi1csLuSbbrv2unOfc6mvl9WMhEEa8gWFAgyMITD1tsn4TjKBr9Xq/XvyK5fJQaCmnqWPSeT2DOLEhM4F1jnsbdMaU5fqQusRsgefdKCc6/lTjFYEtWfTpqaedhPkXb1MSqHKdo3M4v8Ps4jlD3ATOYo0X4SzVOfKn/7wJ9/5zuCu3WQozEemkCcgIgIUIMwEIFJr92zbumvjxmt/8dOFK4553ktf+oxnnQ8QeJvSUa20RBBEMsqz99YCACnShhDw3AvO/9XPf3buJc89+AiJCAKjCmw+hGpN97alm/qRmVDcjr28ctnBrptmd+E7+ok5025WPa2c1MFojPLwfzKNwQxaH9y8adkxazKAdrbtmEcAVwswi/c8dcv+/mP+OBEBVGmcfvx97/3Uxz4+OjpcaG2KCiVk7VJvnUtT6x2D8w11PkAV6qgpH0TRxscf/th73/Wuv/mbTesfVSbIWOxHUaZmCZbR2piMqaw0xfX4pDPO8Kl97N47KCwyz8aTBVSlItRi1ZSHfOS8VZqof9jXY1R0wNV0kBiMIu8c949KYDj1Usjp9qKU65jLIQFkkjgHnkw6krGqA0qEo+qZICJjRnyHsaE985auBmjss8BphOC5SoHJvzO1AiallQ61ibJutNJR9jcp45lFfKaOMe1OB92nXf/AM+4iU5XR3AcBQIg9f+x977vuN79ub20xynj27K13CSIzOxYn4rnRE0DxgozsBBByUdRcKj1y3/3vfOPf/OIH31faAAiwnxkTZydhN7IGQYEMyiPvfTY8rgN90XOf/5srrgQkmVn4IyKgYmDKFRiF0FF7E1ovWkOlavcOESCKTEd9ZsoYZadw31hangi15sRKV7NSOk2tbmlq7BD6o8CEBxMESBhVYGuVOLXNXV3sLB6wtmSmec0Iiw1NIadNCCqoVsY2PPbYE+sf37N7d1yvGWO6e/tWHnPMmmPXlZrbMwo0Ef0h3RUrHX39v/7z5quv7urpcs4xM5IQghhCRAVImQ9g8SIEqJQSzw2qlYgAlJqKNvVf+rd/37V925ve+feZAORhS/IZ+TCC1tpaKyJK61qlesY5z7juxpv27tzUs2Clq45M7QPLegwkgEaR1j5JVU+L3dSPQoDi+/fBkgVyqKpQQAB8/4CyKZo8CqjuFvAegTCM/gDbEo/mxgJajQ/uFSQdFVxSUaSP3P8zszb54cFdV/zwJzffcP3e/n6bpA0FWBFg0Sbs7Ot+5nOf98KXvbxYanEuVn8Y22JmpcP1D97zk+/+d2t7i3WWWYzWseM9+4aqcT3T8DNB0FYqdjSXoigUz945pRQSemYiQhHvHWoqtRR/9r3vTkyM/8MHLyeio9F3bEz1IGGGA4II5fSzzj//a5/419e99/1dvfO4XiGiyfXwQFkYLUUyEZvWpnopZ+qODMHAiLBkKMaU09JT17QHR6xYgd8zkEEmklOqvZmrVQgUaA3ewtxbbw/RAJ41ZZY5dtIf9EyaauUAwPDArqi5dQrtzPqfiPuZmbMcWWZRSqvw2l///Ntf+erwrj1BLizkchyGIpLN2REBEY4NDf33F75w+/XXv/P9/7z8mLXOx41lWvt/GM8BTsLRQvM//P73hD0qZb1Hooc2bNw5uC/KFZI0qdZrhVxeKbWtfyAXmHkdbcsXzMuHxrE03JUIETFrRLDWdbZ1/O6KK3JR+Hfv+5B1VoPgQWJp2OANzTj+SJPVK6GwoKJapXrKOWe5uPZPr/mrN/zje0592jO5PpYdhMlBC8RCiUYSCDW252H7CGjjR0fdWBnbmtA5mbwap+szISiSesyjZTSaPXNrUUeBj2PKRf/HG2WZ7sfo7r2tra1HDpoxM2rj6slnPvqhz3z0X2rjE8W2FhMEGXe0EYMABMkJmCBsbm7p37r9vW996xMPPaBVJMxPdRAUpcP+7Vsfvu/+fD7vvQeh2+97sHf5ip/+8hf33X/fHXfe8fGPfqxUKilFuVzRiX6if/CG+x/aNTwGar/klfdMRBn71DG3t7df+bOf/fS/v2O0YZYjHPAUoEwjJYtVWfe0ntpznv/8d7z/I1/96H9sfeQeDCOZnsiLKBWIAvGpaWth7wXBW+uGRw7Ismk6SAQEPDpG1Zi0BmbV2QZK0DmKcnC4mukpwb1nZzhNJbwAOwf6w1IBDskamHoHZlY6KI+OX/737/z1L35aKBYCbYgbjk0RBUGARPU4Hp8oT5RrXlAFYa5UrJTHPv6B940MDiDqp7ZWFGYAfOju+2qjEwFpUuqW+x845oQTf3f1NRdddPGiJYvXHXvse/7pH7/73e+KgGeLivO5yIG669EN23btCYIwU7mf1GsizGB05pam5q//16cfufcuZYJpqznmLJgQEUipIMgVi/lCIQoiRASFIZrRgbEVx53wkte8+ltf/DKilpk5ECvFkYY40a1NTiMyGGY/NAQzQxBNx/gQwA2PasdCiEqZ9mbxHokkZ2ByxQ80iqbfW/ljlukvPERLJHtwtFxt7ugGACIl0FA04Fm6+pihRPVK5RPv+6eH7r+vtbXdeWe9ExDPTCZIGB7dtvP2Rzfcu3HrbQ88esN9D/7qpluvv+vu4fHRplLz9q1bvvH5zxJpkqfUVyMCwJZNTyB6kws37uofmSi//a1vM1rHccyevfdpml7wzAsvftZFlXI5S5uUolwh/8iWzVv3DAZGA4oIMrNzzns/VfMy8hc+9W9xrYpEIjx1mg48pPur1kzPQrQxuXyukMsbhUIcRXrHjh0r1xxLKpgY6qcg4P0ji4ggVMhxYikfQBQIMxHRwAjMLCT3h8LsMT80JppAhCNDpUjqiUQhkob/07fs69XqaVQoHTYUsggjAst/ffxjDz/wQGtbG3sWFma2zpGCPUNDtz342M7BYRaoxslZ5577b//6ya989WvPf/FL79uwdcPWba0tzb/91RWP3n8PqYCfuoCIRCB+9+5duXxhtFrbsWt3MZfr7e1lZq01EmZOyHt/7LHrvPeIqqE7IpjLF9dv2jxeqSulpl9GGXrhnC3kixvXP/arn/6IlGbxRxaambN9Bp61UrkoVFoBQFMueOjee+LyeKm5ybNrEG4mMRsMjDCTJl3Ms/OiiccqUo1xGlQ7zbAQ2QuNVDlQ6IXzAUZK6jFE0YzV33PvnTtS+CqbxOVpl1q2reQIDCvxgFNUa5zzo0VEU/jNL372puuubmoupWk6tXfUaL19z74HN2wiE5SKpVqt9vrXve7qa6955z/8/atf+5ovf+UrP/v1rzYNDm3bs49t8uPvf+cpzbCAkLxNxkbHkPSugQFA5azbuGkjETnnMo8lIkqpTZs2KVINpT1BAKVIAekNW3YQE6qG1tJkA5uJlHO+EIW/+MH3xkeGlAqOJDlpvAlOClMiBcYQodbhWeedly+UrrviSmVKXjJTmdQTMRoAGEE1F5GZNem6k9HKdO2d/RbDhFyPqRaDImA2pbwY1UiwQKYN2DTuR+f+EQXQexER0AZNnkyeVChCwqB0RCrYr8s3980y2DQGyPTJDzYpBCBmr3V0+w3X/PA734tyxSRNswnE1FutzMBY+dEtO6JCk1JUq1ZWrVr1r//2Sa11mqbWuiRJnnbW2W/8mzfet3GTFXrg9tt37diqdDCZxR9ibAaPiDGKwCCps7W4PjQ8hlqHUfTJT/7btq3boijKdE2CILjl5luv/NVvik3N3kumloMgnsGEuXqaSlIzGGRyy1MVqWfv2aEOdu3ced1Vv0FU0/0sQ2MrOmdU4sYcz7QLvrHkGAFQKeVBPOHr3/mu3/70lxseuFNFRWafPZGFAZUYzTZRbSVQpFAxiB0dlWkVtJ66xhFAJso+jYNAeRFsLmSj1hKGIlOTtyhHry4qAixemRBAg9ih/l0D2zaMDu6oT+yrVys2qZuw9eznv6pj3gL26VyejwGQOSoW4lotW7Y562iNiCCZ8eHBL3zmM0Zp8eJZFBEiKCTPsH7LFhME2Smp1+vnnH12GIbWWmMMADgn3vvTTj5Fk9q8d4isve/W2+YvXMIi6vClKB6GWYDAIkqbIAyq1VqSWtQUROGWLVsuvuiiv37ta08++STv/C233va1r38jTa0OTCagjdMySMfAAHmtE5ftSyVuSD1mS8DEaHPjNVdf+tKXk6LssB2WbsHM3rrGsmMBZkZCm6ZRPv+CV/7Vf3/uyx/63PGiAHn/DAOFgSQplXIYGgTwGnBsnKZ9it6PcwDIWFm8RY8soprzaL0olEBlOOKsNJHDbgRh9iqIFOjhwZ2P33PL8K7H8xS3hKo3HxQ6oqCnWYWd+8bKV3zpgy9827+WWltFZtdRRRbUJNaj9SA+Y/GDzMS9BEREKfPdL3+1f8u2pvY2sR4EGRARjAq27x0ox0mx0OQz1PegYpaZjTG7du9WqKqpH56obVj/yFPYuhZmpcKWlpYkSYQZUTFzPp8fHBx8//s/EJqQhVPnCsViEAa+sUIXppc1qafUQncU1MbjxjnOAHrOVGsk0sGOTZuHB/Z09s33PqHJ1+7vTMgMS0NErbRznCTJ9LxNKVUpl9eccMZNV/7qkTtvOfbc87hWRiQCZATSCiqJNIcYhVKLQbGMjjPIFI9yBrjsxydI2AOgVqqY82nMJiKhyaGBWWxorkCOAMIsgioo7tuz+7ff/cyt//Pp3OijZyxtPm35/KXdnaUgkjitjVdGdg8t6u4449j5t//6x0SaG+6dJic5AQWYRQXhVT/8LpVHFi5e6qu1xqJ5ARTB/fRXVsrs2LrxN1dcUSiUXOocMwt4FufZgewZGdVk0iTJ5oPzheKNN91cKVeMMczOexuGYaVc+da3v5PL5RThQLm8ddNml9RJ0REzO/AQ96y5u2zxMudZSIEQIHr2JjAtbS1hqRTkCsViEUlleqo4eeIDbSZnlGXCcT4XeucEkBuNAxDBhmY7QlKtjg4NASCwBfbZk2SK6DozlxERRlChMVHgvbPWTiW8mZ9fum7dY488DGCmjjIIShCITYkAIi0soBRXY45joIbh0nRH5MuVxlLJyKjQSJqACVAOgJiP6GZZKMgB4bU//85VX/nIIr3vvOMXL25vcWPlicF9tfFxlyTZzjwCtW39tgV9fWN7H5kY2auUEZl+esCJKG3uveGqB2698W0f+EDQ3kJGkYiSA/lfGSvoR9/7/tj4GBAJgwj4bK8yYi2NxyvVluaWE44/PpPEjXK5rVu3//VrXte/u18po3Xw2KOP/fnLXr7hiY1RLiLCurN7d++pjI/jHJH3aG0riySr1q6JjFGNHmYj+jjn0rjW15o7eeUiA9miBCIgYGltam5tasqFkVEKFViiQlMTOCZBcDy13LLBmPci1saj+yAuS7kM9TLUq5LWQRwAzzEXLwCgtQ6MERHvs/UCDQ/X3NwR19P9dV4mGRIYAEFgKYTMjKQktVJLcJIbqKdCmrDARJ0JtRfOh2g0OoaCAgTiQxnVwSxp9s6ExYFdm379rU8tbdMvePq6+vjE8M6dRhvSRmmdVdQigoTIjCC18sTCzsLDd9509iUvZeapwlWQkbSNK1d9/zuvf/f7VLHo04rSoRxUPoiIMsHwwJ6br7m+UCh49uxZaz1J5IJarZaVo0P79hGRZ05SWyjkr/zVlffdd+8Jxx9fr9fvuffecqXSVCp5Z1EhgpQrFevsU9V7RyIAXnvi8Uvmzdu8eyAVp1AhKqWVVsYq19HR0je/98FN2wWYRTxLZ1NLd0sbew6Uqaf12Cb5YnOhqc1ZF5hAITGzeEYBwozSgB5AVcZgZBCTGEwg2mBgyBrRWpQRbfAAONpzBsMbY1LrkP0UbpVWq0m13NHZCuBhkkePAKIIFTEzFSIrQgiYOF+Jg7bG9aen6k6uxVKrZ31OyAdEKAwYBCAzVNVmacZN0+hE9J6dCps33HfnVd/6xGXnn9zT1tzf309e5cJCtrg2U6727IG5VrFkICAc2zu8eF7fLRseFHnJ9LlkZlaa1t95x8IlizuWrrbVYZ2N0jf2ZsMkryTjw9Adt982sGdva2tzBmF477MjpJWyqWWAOE2q/TtRh62FaOn83ke37MyXSsPD+6688leEmCvki6Wi8w4ASARAO+dMBnDIrNNsGWwi2Ygfg0Oiqdnzg59OiM6mLZ29z7rgwhvvuivmQBsKjcnnC4Uop4JgopbcdOf9gJQLMArCplJre3OLAgIDWpswDUfGJ7p6+nLFkninFbEHEU/Q2ISgGIW5Kcq3hwGMDCIjBIa1IRNAYMAYDCMRRmUmx3WQsoLdOc+MBEQKxE9TP/frH3/wZX/5ZwBxptnY2O2DirURdlTMAwJ6EGu5Up2JY2VnKIkxtQTI4iDSACwColSmq3YoZuSUICKCY1FB04b77/jFFz/wFxef1ZrL9e/aE5Ixirz37AWFlXhOU0l9Ersbbrn3iU07WVRSTQyKlvKenZtRB1P6J1n+VK9W5i9eeucdN0xM1ESZaVOZB0Lzd915p0jG2m0o1zXYDSIGiQgZxRjFnouh6W1r0kp5541RpeamQnMJEMWLUcboICASpkBRPhcKzDIkKSIspEyog0gFgQqMCXJah4cGkAgJQC562UuP6e2N0zQIo3y+UMoXCrlcwQRN+abF8xavWbp81eLlq5esWNDVE2qjtFLaRGFUzBdIcN3atd5aQmDvgL1G0CgahVgEoe6Spb3dHfmcHx2BWkWqFYhrElc5rklS47gKSY1tws43UjNAJFJKsUiSJpzxuhpcSB/kCu1dXbt37gEwAtnOZBHxIISBQfYqCoVQPHh2Ui5PVQX7WzpST8F6VugQKQrEsyCgJpkpDHOI+kjEk8kP7Nh05ecv//Nnnq69G943HBo91f8TkXK5tnnzjnol9tWkqaPDRrnBvSNxPdGBqe4bWtBW3PjwHQD7E2UkxcIrTjzlqmtv0Nq0dXYLHzRUiQAASilv4x0bN0dBOA19BQLQSCTSmg9zilCQQDXlo2rd3Xrf42x9QMiM3nvnvCZqKRTbm5pbCsV8LkfIvW0tQVOJD9gQCyAipIxS+qYbb/6Xj3307W9549+96Q0fvfwDt910o1Imk8WbKxp6ZzsXL/vr179O1yuhCfNBGJrAKK1JGVJG61wY5qJIKwo05EIdBsoEpAxqQ4VS7rSTT9r8+PrIhOIYBZAFBUlIgyKFktafdcbJ2iZQqWEcS1yHeg3jOtZjqCcYJ5hacVbY8ZTSLQIRBYFp7JhpsCiYiKxLj1l34i3X35whFxla22hzKULLlAtAKQZBRKmms/CxfC0W77NVoJSLxDMiAWmUw2l7y9Q0BwHbK77+6dNX9ZSC/PjYmNGarQf2CGSFwXuni3c9dt+6RUlvT0vO11ceu+LRG+8oVyqtHS318Urf/J7bd23grHXfiDSgFN124/XPet7zTz7lbF+vkFEHsbhBQJB0uTw6MjQ85UGFWSmVpQve+a7WtlK+f7ju8rlcMV8ITegFUxvX6/XEWieCCKV8oTVfRFLCYjkaxeHFSxcDBsIWptEKhRlJ7enf/aF3/b2a6C8p3Ds08ejOgT1jE5/+90+/5tWvufxfPq6MmnOaCcE5+8I3v/G6G6779m+u6zjueE2gFSKhZCvplFFEhAJImtAo5TwEWj32xOPPuOAZtjK+7YknmptavffAIB60IIgobUYro2etXHXWset4bB8KeLEqCgTyLJAtjEYiNI4yQb4Mb2FukGoQtdY2ddmCvGy9hk3TvoVLJ8rVeGQwKpXYT0ZJENGEsUhOK63EW0L0cTwlHEH7fVeaZoGHSFGUA+cICUEdflI+m9plJpPbtv5+GdjW0do+UR0FEJumjLR3Ir7t9vvGR0Zr42MLli1uWbRgz+5B63x9aGTJ/G7K5weGhhx7Z1mzhFLbu3MrKt1YjqrN8N7dg9ueOO+5z/dJlRThfrXgTAhKGlQhoFq1FtdqWWHL1omfXHDvvE1sFBX75vWxcDGMClGuEIZNUdBSLHa1tva0tc9r65jf3tXV3JaLckZro3UhKgaIq04+ZRYmFqKIvOOtb/vVb69evGRBobVtwpPTQWtbR2tLy5e+/KVHHnpQTbJcZjMsImAIiv/yla+dsGbZpo1P5HO5KDBNuai9lOtqynUUdE+TWdJVPHZJ17olXT1NUSkXjk6UMYwuu/jZP/rSVwsmZPbovWJQIISgta5Wxo/v633zS5+nkqpz3je3QGePRSXeofdsLTvH1or32Nhf2CDEYHagRJSiqbRVGBGIveSLTUB6cM8AmCBLJzPQHrRi70CR0kpYCBFsfarpt99jSWIbQ72EpLWwoEJRCI6PvCSqjA0HbMdGx/K5Du+89y5XCkvLFmy57t6m5rGejtLItidOOHHNdRs318dtoEzRuY6FC3Zu39bb05sLqTZem9ccbnz07r7Fy0QYBEjhQzdfu3j5cqAAJEHSWVbZ0BtEJHbAHhyDccbZSJEXT6KQERGMoPKAwgawXqmsPWb1Y1t2FQv50AQZMiQgGCJkUp/CQFqAmL1z3tm0ubXpaRddDNNwv8nyhbxzQ0ND1vvP/ehqa4GCnCYONI2Vy6vXrlm8fDnzoTZmISnvbVN3389+85u/fMlL73/ggbPOPKenvbSwq3lRT1trUy6KqJgPI4XjFXfTA9sfu/eRGtu3v/lNN/z4x5V9IyYXeGZNCpFRoGZTrNmnr1n2mudeVIyI44pq65OlKwlDyJd4qF87S0jiLDotaSImRB1mSxghm3R2DhVlsYJZpnJcETFGE2GtHmebXac6L6iwsZkn0FnTjxI3Cx+L4wSzdEop1Aq8F1KZ/uwRLW9FBEh7Fy4Zt6pcrtXrllmUp4nBvUuW9XUsW7pvpJyglIcG5re1me7uPcMjCXA6OrZ40YJKzKMjY0BUGZ3oKITlga0iPFUblvfsWrBkqQjTdM1FABJQ1mFch8qYjA/J0K4mH7cU8pI6zawRNKISIQASyIfR4OBQb1fPvN55PvVGa6UoUCrUxmhjTKC10oEJgyAKgkCbKJcfGBy8+NkXz1u8wtmUcIZ6CrPXQfCpz3xm6bIl5TgplAqlkEKFY8MjuULxs1/4fFtbu8wwrFkqH03ore3sW/TLa675y1e/4u4H733wicdj4c6u1tXL561Z0dfT05SIv/Xhx399xz06il584YX3/vqXOzdtDIuRhcZinDhOy+V4XlPxzS+45K0vuayQQ+eRiYQEtAA4ZIfWgfPgHTJnO7MlteAsZWJVnhHReZ8mqfONWmfaOJZY5wGxUMiB+P39PAFABSKEAIECAVQE1rH3WTWn95fF3mcBho0CQ1B3bCIDxOCnxq1lNk71VMNBXNIxf3muZ+Hw6M7mluaWQo69JDapbN960jkn3fXDn1crsQm1Hx5cfeLxm667qrfaDil3z2+KWltGx8d6eztcmojlnB8fGdzd3r2AfR0AQAWFQgviFHbc8FngU6hVIKlLrQpJ7OI4DIIV83t3bOunAJEZCYG9UgoBxXkE2r1x+wXnPe0H//ODro4OBG+UCnTg2CUu9SjamEgHStCGplKvW0ne/PZ3sMyyBpKI2Lt1xx9/xVW/+9iHP/yTn/xkrDxhHa9bu+7zX/7Ssccf7106lSYKAgp5ZkQ58NpQ6F1qovwnPv3ZP3v5K/7rP/7jez/59Q9/6nt6u9pKRets/9CYOFiyYMGC9tZ7f3uNBwlz+ThJU5s6Z/OaFnZ1PO2EtU8/bnWhlEt1SDWH7AG1jI3j5h2+kIPhcS0gmS5dpu4oiCycpqi1KJ0tOhdpGBCLeGmk9URUq5XjepLE9faeDnB2/7kGAdICHkEwMCQkSsB7sZ5CQp6U40Yiu3W37BsRrcCocPk8SGPUIZZKwLx/zedBw5+4f/kDMjsyhTSubr77tmIuKuYDBg+I1fGJxcetffiJTaaetLYUktp437I1jz6xqYQY6SAMgzhX2Ltla297axCGAGJ9asO2rvnLvPWk9YZHHmxpa9ZKiyIdhA19OraS1LA2AeUyVCakWsGJCYrjolY333mXCiICJEBNSqMiQBDOmWBgz95FixfqltL2DZsW9vVG+WhBT/u6Zd3HLOpatbh31fyueW15VColc8ddt3zg8vecf8nznXezTlUgIntXKJYuuviSS57z7Lam0okrFnzl+z+cN3++szMEbSgDeZUiUiKMs5FmvbfzFi6+7CUvee6zL2gr5SuD+8b27qsNjzdp6msqcbW6a/uOVMAzgrimMFje233BSSe+9MKnvfi8c1atWEZCaXuvWbZc6jFWKqgVImCtQuWyEmQTMClUKESoAzQBmCCrEUAbzDYap847L/sX9zU2t9fK5Ttvvlmhf9pznueS+tRStMaQwcQE5Qp2YFRGq6hAiMyalWSUzJjScV4IBVgRgVLADUs+cliZiITj488574FffH90dKRYME2lvICqDQ8no/tWn3zSE1df397dFtl6a2V0/spl/Y893tLcFI+PL+zu267DfaNjvT3dSTXOhzC8azPAMzNm/rozz7r6Fz95xoUXrzz5FOecAiIRcSlXJ7A8rmo1qFahXsVanavxSX29F59y8hV3PNDS3ALiAbNpTyGAFLgpn3/oxptPueACFF6/ecvxy1b2dbees27+gq4igNTjZNfgxKZr77/yqmvf/JY3vvqN77DWmQObOdPkDIi8t8y8atXqv3vL2372hU9GUc4msTF6anV0BqGCMtf+8H/aettPPPeZ3tkDZssQUSntXAoAi1Yf//p/PP71/yije3cP9ffvG9xXq1dr1RqghCItpNtyQXsuas2FSArqdanVbJwgikkrvHcvVatsTGMrOWlSShQgOA3EoDNZ4f1sB8/IIgiNZRXC4GFyuixr5+uRfSM3X3/1Bz72QfFuej4wY6dtY1oVRUCYAVFQ9DS7shqJhZGQs2IRRQGjMODs+2emNMEnj5Bm6/LNXfNPPWfbNf8T5Qv5KA/AygR7H3tk1ann3P27W8b2jfS1twzv3Lxy2Ypr7n14olYFzhWak+burqHhke6uDstSyuWro/sAgDQ6a5cec7y68hcqV0AMlDhAL44hTjCuSrXqKxWsp6oau+oYWfFJ/NpLzh+pVW57eFNToRg68o1kVFArjxjo6O7f/W75urVtK495cP36vcN7BkZ2LexpEee27R666taHNuwauPyjH377O9/lbKrVAVYlwErQTclEIKFi9N6PjA9/5cvfOfnFf7Fi5do0qSltcHKZqWMfmvDn3/7KGeeff+K5z5oLPs38IjvLwkqp1p75rT3zV05/RjoGoyMwMgETY65elThB9mgI2aMQlitYrqKIQsMAgkAgLAxC2fdEBEQNojKEhhG8sGIWQOe99+IFKMMFJKsN2QThpo1PnP+scxesOcFVRxvYTQNmRBTwQowEpAQZUYtn9qlAjoT1jMG9Sc5XBg49Ca4IEgnb0573gg03/LY+PjHRUmwp5NCY6uDoApeuOv3EwTtu7WhukrFK5wJqWbZ8z9Ce5gVROjo6r7kwEpcz5la9Xq/aaoP8QyDi8mS6enpALAmwd+ydcpZqsa/XJKlzEoO30NIqYxOUpjmpv/dFz/lR511X3n1fPXZRGIAhMgozBRSEXKl598aNzc2FE3tbdwwO/uY3O2r12mi54tCcce65//Wt75559tOsrWulD5oUEq0FgaZ2JBND6myQC+679dbxgb0feOubPvf9n7a1tu+ffEIItVl/962jI2OX/NmrQfjQo7BIqEDB1KLXBoApmNZlYkwqZUxi9B61mmTGsYCCBsUuGxDzk7PLDUEwAMVASFqymRzJ5qSzNZ/sAJy1PoOUESYXjSICKKWG9u464+yTp9dSWabbuDyk4bkR4ICBDT0raWiahR31mA27uLtn2eKzzhu69Yq2WpsUct57HUbDDz968uln/uSeuycqtdbm0sTebatWznt491bHAi5uVtLU15taqw2Nj43p1i4C8MykTVKvphPVXC4C79l5AA8gYq1UqyqOOU3RJ8wiQUEUSUu7lIowsu/lF5/3tLVrr7znvkd37B2dKNckQTGEBIiWUWs9PDqB4jqifNe85qb2tkXHnfC0Zz/7tHPPBQDXsCo8gGmoUI307yAKWnr6nE0JUIiCXGF4YNc3/v0/zl1zzOCm7a941oV/8/fvOvXsM5taWxBgZM+ee2664TMf+MCZl/1l27x57BIkdYRHcnpRiYCCKKRAK9RKnBcSEEJFiAFy1rO2WYTKwBFBBFJACpUmpQU1KA2kAJUwZVmUs6kgOW6Yk5/aOy4gANVKpX/n1mPWvQogJZpWD2a2wXNw9A42LGmQxjKsRqZkEeZmhswoDCelXRWwO/e5L/zOrVePDg8XCrmWfMFSOrJ394qk0r1yxbZHHy6USlKeyDm7dH63ELL3KEjgU68A7Nho3H3yukYcBwDnU07IO7Ak4hAJQSCNIa0De8yUfcHJ4KAIwOrF1DNPtm5MN26a39v2Ny+4ZKwysWXnni0D+/ZOVCeqtZqzoHRgAlMsNPf19CxZumTNuiWrVra0tQOA9xaElTKz/GAREJ2k/quf+sgb3/WPHX0LACC19TuuvfYz739/bmysY/6Cvua2XcPDX37H332rqbmtrc0Q18bGOKl1oTJFLYcWZz5EMxZEwAMiECGRmABACIlTFlGIAOBYGAEFiTRlIwxAgESiCBSKIjAKlEKtUSlBZMGUsu2G3nsUyQhnDWk7EW/C6Nc//nFvX1f7oiW2VjGogRrEpCmqrKDPEH1uCDcggkIAAa1nzDswi8xY0PFknBYh26R70TErz7pw+82/zhXH82EEANqYvY/cfeLKpb99bH2apPmoYCv1jqYWZrbeIYFke2QZR506ffWxmZMVFhMF7FxcqRWaDXgGIhQR5wCQM1evNDCTQfTiRoY4NGpsQpRy4iG2zd1dJx27+qTdg6A0GC1KcRCoYhO0tEFnB5SaAUIAYJeKCCkFc6xNQ0TPrnfxsmde9oIvfOT9RTRpPdmyY8vAxk0Li619ixYLi7d+SUfn/I72NE196kSg0NK9oLN9w56B9o6uTHTxScztiwCjQtJAGrQG58GzMAApIBEWQAIiEULMyhUBQkFArdEYMkFGnhGlRWlQihFto5cjDMDc2EYxOY8pQT5/6zVX//qXP/ncN78oLlVAMAMnmZFk7//vabm4PmCQBjNiNjMcoS7yrAdCoXh+xp+9+pv3316r1sq1SktTSQRrE/WIBk5ftwI8exHSNDnh3uh9atL16gS19/YuWiHsENExG5MLdDC8dyDf1k7WAWfOQ5AUKy3kkTQoAfZCXg0NyuAoiodAExIQeyKByDMotqSUKETS4h3XxmQUMLVQKKHJIdHhd58QOJ+c8YxnnnrO06/77ZWffdPbTuqbt3zxKs+cpikBBkoDEKeuLZ/v7Wvtam0phmFXU9PWiYn5y1YcVXYxhRg2GsWogBRqA9qBZshAKWUmq09EIhDIglkjwUIAo1Fr0Rq1QW3QGFGaAVMRB5A1nFhYBKd9HCORrSfX/PJn73jfO7uXLOfaRMbImD5mNTkngZNUYcFMYBFnhkIBUKAABQHRO2IBQPAMmH0gymx+e5LBqmbLtOpNnfOOv+SyB37w1eZSQQVhzhB7qY+N5oLA+UZ89tnYiBCgMIgh2TdW6T33IiTlbUJKZYPIi9euefSuuxauXF6dmIha29ClAkgmBO/BpkAoREAeEVAI2TOBoGIEVFpNlP141WgDoc6gPeTGelsEakhOHNnpJgFB5WyidXj+sy/9/vLP6SRlcb3NzR0tLYEyaRIPjk84o09YvrSnpUkMKAuBVuNExxy7apIzM5cMxCzJLk6FYRJQBFqD0egceAVaN86CYhQSr5AF1SR9jgAJkQiNkSAQk7H8FJPyqDwgg3j2U4saGl6Hgb3kW5puuerXp550wlnPvNSWB7QJpkrjydUoWdD02KgzmPavxiAUEOD9oiAqDDLiIHgBZkFs9L2PfuoZBVCht/WzL335o3fdsXdwuxBSa0ugCEQS67Ipv4zYKSDMQkqxZ0Koej5u5dopd2gQmfm0i5/97+/5h+Vrl/XMW0rYeAHoUIyHwIGAsIBizPhC2JBElEa/WhOiNLw0AiJCFvIJBLMO+pHH+6xWcjbRQbj2mef1/+DHf3Xu2S3FfHZkEWTfRCW2fn5bKya+DmA07hoe9W2dy5YuY57RGjqqSV1AhVqD98ABeM7IcgKCBCAsLKhkPzs5oxQSAirRRkwAOhAVeAoYlRdkQC/I01p1jd0siiwAitz0m9+86nV/xVxXSgHIdOb3VCqN2QQRAbpslx0QEaopossU6heq7ExnvDjUKnOR/CT3tiMKKx2++K3v3eVoZHR8bKxSqzvLgEqRVp49s2TKFo3SHVEbjflcsblt6ogKgXhXbOm85C9f/fFP/PuOzZvQoLAHJDAhmAjDPAYRmQC0ETKCCkijNqBIphRKiYAQG3U+ZrAONFSEs7FPPFpUBURe9Iq/rBUKPaXmVFLrnfNp6m1bKT+vrcmnidOIbJvzxV9t2njuS16qyLA/ogRjatZvSlumARAoI8aw0RCEEAQQBBCEYEIxgZiAjZEglCDAMMIwxDCCIIQggjAHQQ5MCCpg0gzEgk6wwTCeRmsjotrEeGdn2xX/84NCMVj7tKdDEiPNXDExKTQr2WxnVt053yhdiUApP6n7NglNkEFGQBD2Yj0QkbWMgHI4nahJDbtZMC2bdM1f8soPfnqstGDDjv5N23YMDY+Xa/V6Yj0zoDjn2QtmWurMKtRRqZCym5pJEwBS5F162tlP//M3vPmG3/4cmMExgkIdYBBiFEE+kiBArVBRtqUCAIlIEREREmHW35k+Z5QtW9MaiWB2Sd5DqbETgXfJ4gWLVl/6/G/edlNfqYNSUUJGDHnIdk86Z7ubmm588NGJBUue/YLLvItVY9Bv9upvaqPT9JngqdVGBAikRAcQRBCGGOUwiiiXwyhCE6IJVRChCTGMJIogn5d8HvJFyOcxX6Ag7ym0yngkC5ggNiT0kBBVpnvLqIBZIV75vR/99mc/etuHPsRsJ59DiAQzx4MREbxjBARi50UhsYAm1JkA3LTkncKAGRCQvRfrMFDirbBQY1TxcES/WZMSpdjVFy5b9YaPf+HRO2/cdM+NA1uf2L53J7FrKuTaW5qKhZwKtFhHSgEwITQXc9XxkUYxO5nrEqFz6TOfe+mm664a3fBEc0+fJyKlAQLJEkbPWWMCBSBzDIqmckBBRIWiFCgtRKwN6hB0mOE68qQktVGhd8mb3v72dzz68Pduv/3lp59aqSfWoScgYKN1WxjedP+Gn8SVj37qPwkcH8F7Hhj+ZoosiAiSQhWAQUBCpcRa0Aa9Ey/seXJYLNvoRoIKlBIgz+QEPCIDepjW1YHGll5mH4bRvp393/7S5/aNj338y59u6e7mpEZKwX6IRCYXKE0qsTEDoTCKdZDlF1plvhwaO6EFkMiPjvutuzFQyEILulQh4HqiW1oBZwzUzgXmzXo8Jjd8WkXcs3DVmtPPX332Re0rjkvJbN+zZ9eOvSigQ50zJjsWUaSDQmGfj5atPi7jM00dAvCCpPbu3DHSv3vp8Sen9SqRRiJBmNz9LI3VyABABNpgBg+SzvAb0BqUJhNIlINcHsMcBiHoQEwApPCoUx/M+jBnX3TJL26+5YF77umM8kUNWjm2fvvAyHfvvvfBno7LP/uFrs4OYXvk2pMNFegGNChy0DovQARCIY1KoVKS/TRjMIwgDNgY1EZ0INow6RQwFfKIHtADTfVTJk+NsHhSigC+/sXPrjj2mH+4/L2tXb2SxI2RkAbPoEHVm5wJE0CSeh2tgzB0G/vBeXTet5Vyq5dn6IWeOkgchVn88SKSpKJL6IXZg1azMZNxGi46J19r8nuQCHgbI3C+EK0+6YzVJ50Rx7Xf/eDr9/7wW4l3+cW9uSBEhDTxHZ2lLTs3ZqNqOJ31TAgoZ1x80fc++fEznncpkhFC8YoIUSkkJWRAx1CvgksztlCDzQ1KsjNhDJkQtKFcHsIcGCNKo8rWy+xfYSV4pK4FEYV9cy78l6997RdX/Pxnv/6NbN4m1iZKm3l9p/z9O1902WUAztpEz6GYLSK0H22ccWSnT6hny9D2r3nOKOMGQBlhR1knhxtLUXGSxS6AifO2keZngjGTiFJjyEk8skJdyBc/+YF/PPXc0579slf5eITrMWk1hY3LzO67IBITI7B3ilCcB+sUEgioIHcg8i4AKh/5rAMFIPUElEIG8Q6DAPwhwfcj27KqKRupErZ1EQ6Nfv6r/partU3Xfr+9tdTbnVPIzrECUfV9e7Zv7FuySlw61QBBROts54Kl3cuW3PzzXzzrL19d3bk7zAUsmpCQDKoAgkjyodgUvReX9aaABYAIFEEQiQ7QGIyyxNZAYEBpFHjScl9IxMLok0ufd9mlz7tsvDJWrdYK+VxzqRUA2McioI5AdhYOW5nKAWsnGvWOYGNmSUQg4/E1ghVa61PHk7QDnLlUtHFYCsXC+ODQ5z72wSXLFz37ZS9PK/uM0pmuzP7POqj70oAKrEWluJ566wxqL6IK+VkMi3KBaEXMIChx2iD2W4+5o0NHDzvRikQI5MWT98965eu2P3jTxHituTkpFgMCFZcr89qiR+68cd6SVRmnY+rAKhT27tLXvOk//+GdPStXLVm0wnuPikAZYhalJTTAOWIH3mPGV3YsyEAECkEFaELRBo0BoyUI0GjYn7vLAV2VI/yB2dOcrRNic7HYXGwGYO/qInBgrT4XrD4XbURk1qUYM1aBIQISM08V0QjIwolzqfeM1AA/Z54FYU9aF3K5n3/vu9dfc9VFz7v4Ra99tU0mAmMa7zkZi3GKenWA8gkLJV4KhiupOI+BYRTMB41xz0byjgggGIYUhWLrhMhJKgCoSbxDATl0hgVHkZdOdTKRFNs0X2xdfu7zNv/2e51J2tQUofDE2ETvvO7Nmx+Nkzg0av9nIxAQs+RKLa953/u+/JGPH7N2zSknn75k9bq4PKK1lmwu1Tea6AKM3gNz1vgBRCYjSpM2YgwajcYAqcae2GmD1Y1zMJnYTguOh+GiAYB4L+ABQKHKhjEb53L6CN10TRqcw84mSf0NR4UHEgOnf6sMl8wkJBHJs6SOE8ssGbthykQzW+HE+kKphZPqpz56eb1efffl/7zsuJNtMqLRTKapcFADRxrQAk7mf8LoGQLj4wpwVsoSFQswY0oHAFgoDKmY9yCoFdcTcV4CwjQ9vMUcwZqPaduRJ1esi6BCEX/K+RfVVFCuVNPEEZH3wrWko2A3PHI3kpmmrCoCiIRsbc/8Je/4xL+Uq/Uv/9ent296JOrqigEZDEIASosOxISkQgwiiMIMyMEgh1FIUUhhiEEOdAhIINl6J8lqrsnEeVIyQ/ZDSbP+llmc0JRQJc4wxxnLxKdMfe5lOw3rkTnzvUworYHyZBoYIIhivaunSWJ9ZgPZNoOpfYfOWu+5vb19+4bH3vu2v1194omXf/5Ly447ztXHNQYAJKR4pmDI9LObFeBZcgHesTBqw9UYARgZlKFC4SB2gwgqkmJEwwKGVN1K6tAoqFuh2dGGo5EUn/PweZd09y1edMLp/fde39XRUsqF+Xy+HifL57U9+uDNx598ruAB2qpACr1Pi80tr3nPP+7a8vj3Pv2f51/4nFMuuNBX695aUSq7SoUUgAcgoAweBiJCbUAZBNUgK0zN6c8MSfvdzOFEdaYDjAc/Dac4ltPfqjE0jnPFxP3vOfcnyqTNTUNTJXEcp6nnbCGTTBpzQ+ZeRApNzZym//OlL9x5x02vf/s7Tzz3vLQ+hor05Mav/Vi4TIqYCMq0tasN4SgBsZlwF0o1JiRg4UBRIZIDp3QEGACbClljHBPH9QQDw9YCz6W0JwcesydhW4AAcPL5F43X7ehYmQmUgrieRgJudM/ubVuVDkhhtqdvKoYoJPHs0mT+0tV/888fu+Pe2z/3off1b91omgvWMyN5RFYoWonWYCIxIegQdCi0f+nwlFjZESbOh75P6dYf/OARJaFZQzjrTR1BVJjWnxYGsc7FSRonKfNkKYmIQiTgPSDoYqkljHL33nzDP7/jLSPDez751S+feO4zfH3CKKNh/x45kcOofmaRUAjRWiDlAaAaEyKwqCiEfCST6ywbwxQgAES+Frvt/UZrdg7am3RryVXLpqkEs/GT9reiG93HI81zD3hAhFu7+x658zY7vKezqy3UwOxtHEch7K5w98IVtYlyvthEpBxP20SCjVGZXKF02jMuLFfL//Ptby5fuqJzydJ6pUJEkOlbkAIyDcpb1i5sZC0oKFk7DTORC0I8iGW2Pz5Oj2VHf5/RpZjDFeF0C5aDNnhjw9XRFFFlUnLcWpekqXPSwOoz5nHWwSMqNpW8q979m59d8d1vbNm54eWve/Vlr35jkNM+iSdpZwgzNRRAGtDE9DCMAEQoIMgoCmVsAoBYG7d+F7IwO2prC9asmCo+9f7zBKCai4gq29+CEzUMe1CAU0cGZxUKfyq03dGzVyo66aLn3/Pf/xnX0yAsoWFNGtP6f3/9Sz/94c+0QMf8xc992ctPOvkUEO+8n5qBQSLvLQhccNmL15162lcuv/w5L33xiU87rzoyhpbBECpFODPuNJLiLO/gSV3wA5m1B1wEM0qqo//VOM1GYVqcnVrzhxkAMPc7o5/KtxqO1jM755xzXnjqvTM37AGM0U1N+fHx0et//ssn7rqzb/mSl/7tm5asOxkA03RMo0GlpwrWGadylhPdeIw525YlJOis11EAlZiTFElBwthWJATxAoSQiUBMwQAc1+MfX0M2Ze+xtzX/jHW+fwibmqizG5w/4EKbVp5MOU88co81tfLE+9QEpb39O979F89OPTEFIfqTlvZuGxqvprhsXrdCFPCP7xo5/ukXv+Gdfx8FBtg55zCb00MEQO98EIQje3d95cP/vGTFsue+/BX5pu5yZVw5FwSBNnr6jurGoVM06fYRZm204wHTzzhrInW0pL1ZSuhGnSWTic7BREsBZmYWFkT0zN456xvzf4DEIuxEWHRgdGg0qX39u268+uqH77z1hFNPOvf5L5i3bDUA27QMAAYNADIi7a8/+ID2HMIkPR0mEyycTOYAEdhv79cdLW77SP2OxzAyWIvV+aeHa1ah83KgYYkAUe2KG3hw0AClxaDpwhO4GoO1uGQpTS47kNk81qTF0Ezw+lC2lRkWs9cmf9edt3/gPe/RSbW3o0NIVarV3QND9SS++KyTFHsRiQLd3lJ4ZOOOUV166StffdHFF4dhtD879CzgPHsdRN7ZK7/+5S0PP3zyOaef/PRn5tu6bLXqndVaG62IsuECYBYEhEw0D6fBjwhTg384GY5wbmRr5j6t6XQ5mZEETz6LSQ6wJ+L9LKcZaPskSJEZVJZlioBvMMdlSsbcOUHEMBcFRo0MDDx67wM333TzPfc9ECepFff5b3997bHHJ7VRo8MZi9ZnpMcN6yGc5jUnPZUINyhsjV+H4uq4e1TmdaV3brAbdlKoIPb6BReGfV3gGmsE9htW1uKs3HovPLRBRaEVzp1/vMmFft+gWr5q2pDGXEk4Hq1heWZt8nfecevfvf51qxZ0d7c2ewbLUK3H1VQ2bt92zKJ53W3NhADsBdTi9tLOoeF7t/Q3dXadfNbZp599zrJlyzvbugqF6IBPqZfHfvedb+x6fOPK044/7YKLmjt7fOrTet17T4jaKEJCIkREoqnD3ZiwzhCpyWsTEAWONH2UaZUdzr62qvEQe9/I66ZXoA1wgxmEmcULZDJ1kq1ZzUgoGV7WWMVCSuVzUVytPf7oozdeddVtd9zZPzCkTbGje0FzV69L0i2bHvmPz37sjHPPc0ll+hhtZsFTHqvxhQ+gH840rCnITsbGYaJGne3V6+6XwXFEYRPm/+wSlYvAT+5hzgwLIWvyYvL4Fn/tnVIMsJ6as9YEC7vdju168VLM5YF5Kvf9/Q2LRQD16PjYK1/0wuWtpVIpV4kTrZUIVqrxcN1t3ztQCvTS+b0oHAZakTCrQi4s5IKhsYkHH1kfRflcqVRqbS22tDY1tZRKJWvTwORS51JJ6vX4sfvu2vPYo6uXrzj3Wc96+kUXrVxzQq5YstbFccw2RQSllCJSWpNSpChryk6VRgDY2AdJeGhKMQvvZ/BlfAER5MnFkDhtKTx7Zs523WijG6OHAgLircvWvWY5CjNP4UeT4qWS9Yw9YBCGodG1WnVPf/9dt9z0u99e9cT6jQnrYkt7vtiiNIKwgLS3z1OM27Y/8uXvfmXVmnU+qdI02zqUYcn/195/R9l6ZfeB2A7nfOHeW/dWrno5IMcOaACd2exmDs3QDCLZDBoOxy1L9mjstWbJXjYlL0uzxtJYY8samTMiKckaL4WRKGqJpJvNzM5AA+iARnx4wMuh8k3f951z9t7+47tVeEjdQDeaFMeuVQsLr+pV1X119z1n79/+BbuhsnSmkGxbOEdw6ToiWF6OP/EF1wikZEdWOz/4HaAvbkpmhWUAqAgOw8Zu85u/75xZk/jWI+X9dzTnL7rFAa2uQoyIdKA1eJVA94NPvY7CSpJc1vt7f/dvP/dHf3TbzSev7O6AYUpBDUOUrSq+cOVqPamOrK5lnorMd3KPiEiYOeaMIMbFspzrdso8E2ufKaubxgCnddjcG17fHbk8E7OrVzY3r1/tldmdt9z2tgfe9s5v+47b77lvfnEByZqmacMgVJJ37uAF3doWtMkiB/GtxKT7wy8dcHlbdrnZLM7P9vnmLRYtLyLuLZjUhgS3J+XsFdraCekN5s+ztf1+RyOmpu2MQZlzZeaiXX7+hYc/9acPPfzIo489duHaNSq65dxCkZdtkBcSOueIkChfXjzchEpk5x//81+bX1zCtG/09YqrEADQdJZtjAfBAmAzK579G5gknT3vlpfiRjX91JcKl2ldwzvu7D74dk0v+qC8SE0mQDFz893Y7/DuSInT9tCScJnrtGIzISLjA/4g3NDMvmGk1Ix9vr19/ct/9CcfuPPOjWqsQAiUuXJnPL62uzup497eront1TU2VnjXjXmeeTOIsSkztzA3d300jcirRdErczd7lXcmjSQb9bpd4KxOaXs4isSdtaO1wENnLn76q0/997/6z9568+m73/K2W95y35Hjx7zj22+/a351ua6rpglmyswzmi4zEQHu50klmPFND0IMcRZKbS3nFl4U1s84eoS2n2JyEOvS7vJm/CqcUQ7wpYNC60hIjn3uIWmeF+Cyarx3/dLFrz76yJ/+yR8/8vDD17f3lIus2+8dOq2STEVjbDNMwEBEANis2R1ePbR+4tKlyd/83/0f/x//w68Ivjxi+WDom6lU7QacBdFeakKOTDCZQjLIc9284pJJBoGpXFp6GTXvBkc/AjXz3sPaQtjdzTjTcS3jijpF2ty1FIH97KD/Jgbv2c9SZec//5nPzCXtlvnZrY2kMJmML25cn0xrZodI3U7n+tWNHR4NBoPaNFmTiwHA5ubGTUeP1FGamKCKbjSWlDMxEalISJJaw+TUNCFVQUwIzZyZKzvgPY62D1N25bMPf/F3/iCbyzdjVS6v/dhHP/rB7/zu9fU1ZlfXDTM776umiiE6csD7/9JWAf2inf8+VrFvKmQHuCtiqz6C2RavtVffB2RnkNW+MNRATcXAAAjB+SzPcvK+ngwvnj27cfXa9Y3Ns08+cfGJrz715JPPXLvu5xZcZ84trLfPooYKEdssgpmLO1IrF/Q+M5OdnevHj9/8xUc++//+J7/2M7/4n72y2XqJVhlubDhny6B9zroBgFZTKnJQss3d1u6KfcZLi/ZSCdINmdCgbGYAfn05PXnWCDWktLmTnVqnJFZX3M10n/GHL/UL2S/w/Yel+JI+3V7VGxa++sXH5vu963u7dR2SyHA8nu/NHVpZJaLhpPJFGRNo3GvGzThRWWSE+XSyt7Y8D8jbo0lKAoCFI1PIc0+AJiomosacAYe6aeomAZKqIEJVjUeT6oHVxUNz86O8s7ayElN68tnnmmb4t/7P/9V/94/+0e033XLbzbcM5npL8/0jx4/f+853DlbWYhOaGEyEDL33UVJMkY3aLXUrnjUVQIA2zXlGYmkTwvcPMGytBXVm1MJknHkkI2sTksgxEYFKqsbb1699+cyzX/nC5x/57Oc2r25oHWJs5p3zrnhuazc/eizHXKJpSohARA6Jmax1yGbUmT7TiLL2WYoxjkZbt9x676/8P//ZB77zOw4fO2GxaeX5+17lsydOVRFfdScOiomBzcCqQJ1CxhMdjsk5SZHXFt18D0RvtFt7FYk9ry6HLCczp6BXd+D0ISu9jSqbmzedKTu+SWi0rbmNjU1FvLi93UgShYWFBRWNKYYYW6J/XpT9Dn3XfatXrk+vbI6evry1tLRedvJJVQNiSGlaN00oEaARcUgMKCpRLSSNCi2vHhBc5qu6HgZZyuhth44qClhizJ7a3hkRLszPlVDWIX7usSc+9blHMsbMswe76cSx7/3hD7/3Ax84dOx0r9OtxuPp7k5/cbHbH0DSlMRMQxPUpOiWhpiimCKaKCQwQGJkP2MVo5AjRiRiR1jX07raHe+OJWnAVE0mO9c3r1y48Pzzzz/zzNPnz1947tzzp8r+W48enyvKsr/gEGqiTzx71q8cLsChWqfw7DwzO+b2RCFCNdj3tULTVgCASEhM0+m4LDuD/sp/+/f+b//NP/i/6/4R20IZjIbM6Aghn9VXK9/dD4SemaAgQqw1BDc/35zb0EapzDQGPLxGiC8LvnevUNYozA9oMJCdbe8o7IytaqBbyLgmA3rRKuvVkfeDpLiXLWgNX1lYMhwO46RylIkmTQAGqaUj7981xLw7iStF5877VnaHk/Tpc5spCyGJo5YfooBRVJuGlBySJ0bAOqSoGmJKs+kcAWA6mXTI3nl85S2Hl65OJjngXkrPbe92egOnMSB69tl8jrwESJoCIzxzdefx/+Yf/uqv/Prxo6vLi0tz3W6YjoZVc8fb7nvLO96xuro6PxjkeWfr2pXpzubcwtLC+qG813N57jkHxGo8aUa7eZ4TsYjUdT0eT4bDne1rly+ef/6rjz762MNfHCcDn6UUJ9NplVSMkbwWbqGzcP9ttxVojUiQJOQ/+8L5abd7aG4OUYqMHZNDdzAqteNkAtL9taMhEhkzk/OIBGB7e7snT9z88Gc++9An/+gd7/22ph4XRQ7UIjUpNdPx7p6moKJFp+zNLwCAVdMX7Z8NAcGqCSOY83Jll40UFZn9kUNfx7uhHVLQMR5dgesb0vU8qW1rxIfn0+51qyZYdLDllM3GoFffXSC+ZEEyI8vstyMH2PNkNJlMp/2M1VrZqgJgSoKIIVgIQkjJAvisz9lgAW9Zyy+dGWfd0iKYpbY/qWPjkFk0IjYkRBhiEsOqlqYREUOi8WToABcy96GbTyzN+7LoNYPw+Rc2d1JaKXMQdajGqGosyqSEAAZ52S16cyHFpy5u1GcuSEqZYzX7g4e/5H7913tFMVd2y9yXeTYdj8fjSX9hvtPrdcoyyzwAiOh0MhWVLMublKppVU2nddVUTQpq5PO8KJQQgSErfd4nQBUFxWk9vHttKccUgiZHHSq+urVxJda3HDvUK3LnufXdM42t0SwBhxQTGKTk2YmRzujiZiBESMgGmqQZjcbLy8f+ya/98wfe/8GiM9jevPSlx7749GMP7V16vh7uxOmw13o+ZkU2t/Khn/75ex54Z2qGBG6fmqYynGK3Y02QnT3KwIWgc/1seb5Nsf+ahYVAAO7YoemXnsrAzCxc2eocWwXvZG/oy86BWOyb2hCaATA5njahiBGgBQzQcNbqAhExj/dGR+e7813n2TpF8a57bnrohS+No3eAasrIYCAqbTQYEWpMABoVklgQSSJJBNGq0d6RpeU7+3R6ud+EONdza/3Vjz930WdursxjjMgkaiqWFATafPd2OkJyuevmvW5LpQpECGYRQUWHSfamppPauYJ7nSvTKKM9TVugQkwGyD5HRMCqJVgTdrlT5nPeI5MmM3UAijOSQhsI0UC9bHLL8moTaypoGXGq8Nzuxt233TLf6wIqAImaGqBDVTNFU/DeSzTnZn7biNaCGsykIkgtxcXGo93FpZUzzz33a//9rzz7xBcf+9NPhetXT/ez02u9tblipd9lh2rAqOOrX/5X//X//vQ/+42yk0NsQU+C2FgT/eJCuLRrVYOZlyrCkRXOvSX5uoWFaMZry9zv22RkzsG1Xa2D63Z1NLU1wa9pQHCjS8RrspcQRdUBLq+tnX3qqYH1UcEMRdTYmWFKUoV6NJnUMexNISkR8e50eufJo++5+9p/eHTL8lxNmWc5OaKa2nnIRE2jWkoWUlIE8m57e2Mw15kjfefJox4t5iUzNrU+u7G5uLBQeiizfLYxNBKzpCmlJGoKNMMFtHXTZ9nXNHhwQGhZK7idKaQct0gbqMk+U+/Ae3j2gjFyZgKSZpc0UUs3M9WUonNlvbd7z6HBoYEfBek6v97v/7snnl46dOj4+sp0MiYEQyAiUWNyArPk59YlkJ1LSVVM900RVI0ZRYSIAUykrkM1v7L+f/rf/o3blvIyL4+sra31MszzRG4U2QuQqWM8srD07JlLTz/5xNvf9Z4UhgQADDadMBK4Qi9tuZZISI6Prb86pfZVcGQxdkwn1jEkxxQnVdjYo15Hm1rHFZCz1rAfdP/d0PSV/IDX2v3gzCoJ7rrjtsmkSkGCSFJVgDbWbDIZpxTLPFtbnN8YhT949Cw6Bsurpv7Rb39wANU4iCZp5zJRiJqCSCMpiEWBGCRJSiKSLMXUNONjC8sDD3ccWquDWdIc+Py1a5fG0Ot0PDmH6BFKR6XHQekW54q1xbmVQWe1XxwadNYHnbVBeWSpf2ihu7o0WJ7vDbp5r/RzPd/r+E5BRY55ZmVBeQ7eaZljN+duzoUn7z2zB2AibuExVCUzT+gcOkfMkDF7Iu+4zHK1ODB4zy1HB3Pu5Mr84aV83DTn6ubmo4dCXXvnAJCJHKInbMFZQlBLzjkiliQAIC1EZhBTUBFTE0tJo2hKEkejnV6Zrx05Mlf2ekXRqI2CoQloygkzdI79cDLZmTQxhPNnngMgAzFURbNRxXMdqWrZ2EVmSgLzg2J9XexVzhr3qkt9BHAnDk+fOFOAkYGcv64nlqHMYHtXBl0zY6MXpUlfi8L9WlMhAeg73/XgPySsm9haOu0zerE7N6dmKcl4WpW9hacu7W5N4nxRNE197OjqB95x4l98+oIVHQATtSQzLujMO0zRgEQ1iZnhaHvjyPx8sOZda8slu4kIirCjR89fprwo89zMDJWIeF8959mZmS8yAtpXFSARMZNqMjXRXI1UlYgkzUKgZGYFhCKpxSCIOaYUg4hBnVrM3bXxDAgtLtDyVaC17ozAo61r9x0dHBn0hlWjKbqi+J3nHl9dXMmZgggiMTsgpDbEB9ksta7/IaXWwj8mNTBRUxViijGmZECMxLNUoulo0J8vF5Y3r5w9XpRJYkxSRe5kWRXEQwQyn2chRRaZhR62lgJ1nULyqz05t0XjGooMqoaOrmuR4aslAdCrniqqwKvLtNCXmNh5uLYte5WbH+h0TE3zMutkgDfmzgMAzKSxuvXOu0+cOrU7GhqSAjYpJTNRaGISETVDAGKeBJ00AckcZ9Ph5Hvfd28/M0BWsyamqKaIYpjEQlIxiKoCmAxjCDt7W4dX1zohvevkkcYUAJhxXNdf3hgVRcaIxDMtPiASMyExYDtgOkIGyBxljj0jAzASqKEBIxSZdwTes2dihCL3uWfPmGc+Yzf7YObmusVcp5jvlfNzncV+d9DLB528383K3HeKrMhckfvMc5aRZ8xj864TKxITE2e5f3Z7dGES15eXkgozMzMxERIzOebWhaQ1X5pRBPAgLdD2DSkkpdCybGIMKUVFGY+HiyuHhlGbGAQsqQiggCWTxpIimFotSkgWawBpnwXZ2yXvEHx6/poSgFliRycPvxYz4TWElCrsXXH8KDYJHMI0pAsb2OkgoO0OiQhVXoUR9tr0yBuND2buXqLsOx/+0R+5en0DAOqmFtUQJYmqQkzWNKn1yskc5i1rF2hzY3TrkeX3vuVYE5OpTUOom9A0sa6bEJMZJBURS0nVcFKNfvCeO0Zbl5cKO7Q8yNByZBS8vLl9ZVTnuT/oCLW1MZutQ5S43Q2rzfgGgmgGCgjEbfm18ViKjOgIGFteCxIxMSIhOEKnCqKmkhwqgZoJIqgmlWRmKUZTNZ2t5ybV6NRc91C/V00DRDOzPz5z9sTRY9iSMBgNFNASSEhJ4WCf1qbYCxEhILduFQAImETjDBesUmxm3BuR4Wgny1zkcrue5ski4uW9yfNb46evjrYmpspJBBHUMAK32kWNEUYVz/dkd6Kbe+idpQSrC259hURf9Vih17iqAAHopmPqc44CTPH8NYuJ53phew8k6Y08ijfAcbOX2DpI9RM//dPHT53Y3NhAxBkYI5JE6pBiEiJXT4f3nFzNs0wVDS1J2t7Z+4F339TFUQKMScKMmCvtl7fcNTWop+N7evO/+pf/i3/wYx994OSJ//DYow8/f/bqaLdke/b6eAq5J4KZp/m+gByBEAFBVGyWyoeGQIwKigSM4Bgco3eIoI7AIXiinIgJvXMIACZEBmCmQoimQggqomrWMqgARFVEVFVEYkopJQNsJqO7Dy20E3Evgy+fuzy07NDaIoI4x2aKaG0KgKiFEFOasSHam1pVGQkBfVv6CIikaoAgKUlK7VICFGKKsan6K2tX90aB/eW98cXt8fnt6dWJXtxrxiGWZTZXZIl8VpYAlhzY3pjBY6cTzl+DKIwYVPn0cWICVXydzfsMKRXxiwM4vhabBj3T1jhe3YbFOY5JhqOZ8fzXMin9ehJWMJWm0+v/8t/65c2dHeCZ56mIxBhNFQG294ZLJb3nttWYlAlNjZmmk4YFS+/AEIFNW6WV3bDrVQAcT4c/8fYHOXVvW773F7/7Yz/5gV86sfLWp69O/uVXHv/Es880pqpBTFvwutWZgBkxtaGsrcHRjLOF2LJi2lHUOb/PYkBG9sSE5NjBPhkV0ZBmZmYtkaEd/Yhwf0m3v0CcWQlZE2Mm8d4j83VSh7YTw+cvbd1z+2lvVhTeec6yjIjNgIh8lrUptby/Ed9XMh3k3RMStZqw2YYbQSSJSPtbmkymg8X+ybVD57c3UanX7fTKkhk7hcszn6IqZNBdLebmARIYyM4I+32tLL1wzZiTJctzPnVUwV7Li4i+9gnjbz8l+0Tt+NwVBaReIdc3XySs0UtgUDCF2VP9crXhKxkQjlys9j7wXd/7l//T/+TJJ58idCYIhioWQjOZTFSNDepqjKDIhM7ywl3fGv+/fvvRsfVaAosYKpBpa2KHBpZEpnV9ouy8//a3iUCtEBo42lv7nvf8yH/xI3/9L7/r5z/2gY985Jbbl5JubV2/ePXytd3tSaiRsGVmERgBmoiZEpglAZnxdNu+GREz9gxIgKaCBMSIaARKqLO4IgRAa+n2LSW9fbZn/GJTMDGwkJJGQaSdvfFN8+WhucIhDnr5Z56/li2uHpor8ixz7Bw7AmSkzHsGzma2yCBmCiitkzpgUmmpY2257lPKbLYEb5P2TFUl1tPhcPT+206sLPQ6ue8wetTljlsbdBjJBIC7k856ORgAOBpOUBTme+HcVd0bI6OGWBw/5PtdE32t5tp9jcnNVP2xQ2llBbZ3IPd4eTtd380WB/b8RRgOrT/AqHigHZ65UGIrk90XEuNrsXjbynXkUjP+G7/8yxfPX/gP//63brnlNlHInPeeJcuDwu549ysvbN969EjH+c1J9chT5z/15Rcu1Q58V83YQAFFgRGRqL3BxKBqJvcO6NEzn7np2NtvPnyTxhTIbDhxSW85fMutN9/1EyC7m9ef2zz/1SsvPHHl3As7m5tbW+Y573WKPC99ljkvSK5l45F650BaF3UwEXZM7JIIEMYUWuCDQMXEsY+pFauhqZi2QxWZgorAvnsHELf2+7VJCtVkb+Po6srDZ1/Ym8hWwCe2tx988P4mATMaEDEmkARAZotzvX63OwrN+WsbMYgAirYqaECm9kxCJkRkYkRBJAQWESITUSQkRFPY3Ni4/b77QeU3Hn783mOHJca5MjOJSbxHy7vLYWyHVgYAoDu7vjcnos2Zi4QIKs6Y7jw1k8viGy2sNjGVPd95Wv7kIQce1OS5K7h2p+/PwbVNnJs3tANtJL5ep6eXsR6AwMDif/er/3j9yN/85//k19fWjmRFTzUCmEOgvPuFM3tl8XyTqjNXq0tjoKzPhSNVmpnRmO7vBAkwRRWAXqq//e5bh+nspx7feP78iZtO3XZo9Uimmc/ziKZVIMb+4sp9C2v33foAqFbT4ZXh5gtXLz23ce38aPv6dGsvDpsUFRGZvGPyLs+LTl7kPqO2gQd0KkCsoG3ytKiQMhEjMSGKWggJAZIpACWVJFbFUNdViLEJQTUBaJeKnncPHj6y0jvS660+ePfd/+CTv3Xy1FzXYRWkX2TlQn84raZ1Y2bOu+WleUhSos+ybFoHUzWY8ajaOZqZW4MAnqlFQGf6HxQR1FZuiJnI4e6xw/fM/8bDX6xDKhyrWjfznsi5Ess1oqtr66sw3MGAtN6PFzZhe4R5pqGBY4fz9TUTvfGpxK+DvL9Mx61W3Hxi+PgzbjTW3Nmlzbg55OV5ff4SDsc26ILIaxjiGRzQ4V5u/mAv80IyE1X75b/9X915523/l7/9X4/3RmuH10C0mlTNdGyu9wdP74kpUyfPyAjQrPXxPWDxiBqoASEwVtP41uXOicXuaOI6Zby2+6WnH338+NyJm47cvrq41usu9QaLzWSSBBRFRRmg6PZPz82fPnHnB9UALUyGO7ubm5Ptren42t72hd3NYZyOmmETRsPUNCYOnKglNGulimYAFKOoCrAzpBjjjIql5pAyJjDMgOaQsqw7WJpf7cytFZ1D5dyxpfVBb7CQd5CzYmHl9x79ZAO799/0ltFwtNDrzA96iC4mP5pMkSglmdQ1I42qqqpqEVGg2WTZrlmpXdPiPlmIzEQ0IaKa1k3js8wr7DT1kaJzpHMUVq+t9LOkFlNsGvHc8d55V4gVxLq2shyvXed+mQDDsxdz5QjACnz3TYTULhgA3viJRUYCykXmbz2ln/0id5zVdXz2Arz7Du510+Z16p8EU0R+ecz9AUMLtGUo2osO4PbiJ4Fmom1yCJaa8Y/99M/fd/+D/+3f/Xuf+P0/JHKLC8uLi5mIEnoAE4mARvvKXUQ6sGSfsXxFiZHi9P7ji5JURBDt6OrCuuj23vkvnL2A5zqDuZMnD9284uaOHDudQswJo0mTBC1KHYkZVUHd8uDw2soJIAIkyHIIU4AYLTYhTMfjRsOkqcbVNEJKIiqihiElVSM2s6SiRV6UWdczzZXdni+KPHMJiqybgUP0rc++TqsqRGSOpmT8wuWzf//T//Y973jbNIaizFeXFkzF1Kpq0vrn1XW8enULHY2mU1EFpJRMVKENzkFMSQ7stCRJO1wRIRDWIYaU0DEg7o12f+rmtxd5j2w83+3s7EyX50qjLEHKAEncZ7/4WP/tJ8qsqKZXipPHmnPX9dpOKguug60uZUcPQZIDUs2rN9Bf317BrLj19PCJZ8vJFF2mFzbx2h6sDuyFq7i3CwvzFvRGZ5VXF0vdUHov8TE4+AJEZg5hfOqWW/7BP/61hz772b//f/37n/rkZ9ZW1/tz8xIlSiBqk9msVbfAfou6L2IxAJtGO9VN95w4LHXjEL3PFKws3GEsHUFtslu/8NizZyz5uTOrqytHj6wcXh+sevRFf2B1K9AnY1OREKqZYieMzYDBEWUdX3aXF8AU2bUZHsAEMQIiOIaYgPf/GyKYQtau8klCUAcINmkmCDVyPvtVZBkQZYDcLf7Ob/7D46cODbrlNNTLi4uePbLfq+pGhIklCTHXMcUYoohquxlQIhRp6SGz32+UZNauImBGV0dMKQIaA411uib6Xbc+EMQ6vACu2Ki2goaLO3Z2IwOCo7fftf6O237ur/5COn8xH8yDcnr2kgdODsTAv/VO9jmEpM6+hoDpa/ZYLT9aFHpFdtfN6VMPQ9dBk5pnLpbvucvNdePV69ncABENpBV/48t2O/j6cPn9ssuQNdRq9sC73vUv/82/+lf/4l/8yj/8H65evrK+fnSwsFzX07qetlvf2TjdrnNaob4aM1Ko7j46yIkmANwqFsjqkABYVIvcHe/mh+ZTnWRneO7shRe+9KzlZW++v740ODRf9heK/pGF1ZxzMygH8zatsFOCaDMcsjNwLCoWE5FPoUJHGiK2zt7koIoqwowiCQxUEjsGUEWgBAQInlNMnGftXOiJBa3s9OpqWgzm/s6/+7VLMPqeI6frZupdZmaiUDXh+s6u6Ixul0wUMM2adRPVdluqZmDY/q2YZi76ImqzdgaIuJpUntkYw/Xdj979rtWFxWo6tGlxYScsz6+sdf3mbvW2tTsEY3n0xM/+tV88lPvJzrBzdCk9t2HX97TIuQ66tuxOHwcxcUT2tRXuIl/3WTdCaJrx//TxfDjRzEeT4n1vyQ8vNM+do9Vlt7Zi2qD5G+TjM1HdDYfWi5i8veIjL+ry9j8ww/18p67G/9O//o1/869/Y/Pa3sry6mJ/vm7Gw9HutKlNzUTNEiKomSRFQqr3PnbfoaODotGW4WL7wkBjBkJIKeXeoaEqsqNRVU2j7Y0nkyCS0HFOvhgUgzLvL/bXcvUrR487A6h07dDR3KieTst+P1UVM4pEx67t7MSCQkKxpOZ8jqooUk+nnfm+0kySwFkOVVSNTWrGYZxS2trevjLa3Nrde+jK+SfGl953/9vQIhN7ypAQkKqmEZMo0hJiQ5IQUozRzJJZSJrUkswwvLbfSCmKiAHGqLOfSz6IXrpwcTA/N2rG7+of+isPfHe3X55cWvns1cf/y49/vNOEe9a6IerAut9zx7ub6eR6Of1LH/up+dtvM59P/vAx2h5jxlYH/q735recxFeQZL6hwmp1c+yqLz+Df/iQ9Quqoxxe7H7bW2E8jJubfOtJ8Dm9RM0xy+HEGavEkPi1CusGCevLyWIi4jwDlaEeffy3P/E7//53L567urCw2l9YiKbVdNJMxpPJqGmmSaJqCqG5NZ/+J+++xVItmLVoYfs6ZmZoS1A19w6BUjIgiylCAjExVQIGR6JRAauQJk1kyOqo7LxBUWYD57pm1O3M5UiL/QVIUhQlEud5J8VUuMyzCyHkeT6tK5fx3nCbnYtJ6iCTyURMKhlf390c1SOV6e542KSAFp7aGG2ofe+3fwDRjMAj5T6b7SHMkkpIkgBCSE3SqomqGlNKaoYURVvgU1WJXRshk0RULaV2D6HOFcPd4cbuZpbzuvj//EM/crIzX3Sz9aXif/2b/+OlbG68cf0YhcP9Ym86PpIf+cDxe9/6nruOfP+Dur7SPH25efSZzOdSV3hoLf/hDzl9XQYw7vUA5QwgasUdN02ePgvbO1x4urYdzl/KTx/F8USvbbhjx+2lM8KNx9WLH3+1tDq7UdP9sp/LbAoaJ1nmP/yRj3z4Ix9+5POPfOK3fudLDz8Gibpzy4OlQ3F+eVpN62YyGu8043P33zzwCHvqOhkBYIwREJ13KmKgTCgiCbHIMwBNaoiQWERRYvSO1Cxj7x338w50SUkAlBzVqqHZmIbLMcLlyw2y/+oLzX70IziXKRizI0RJWtWNEQaTNgowhpA0mhkTlh7y3CMBO7+8lGeUP781qovsQ++4D1IQ77y2NArVNqrU2t4cJImINk0wwCRqgDojHxGgIhGaJZGWhYyt3hWQGCUZAUxiVUNcbfhnH/z2lbxXgxyZ63/i7Ge+fO36qdPrtryyceG5o/PZ2sL8pc0rT07mvvtdPybLfRuF+OylnLyBERC/4y4mBpXXQ2N5XYUlRGbqPGf33Z0+/qeSCQGFpy66tSVampeLV6Q/pLk50BfNp2bytIPFxb55lwHu61rtBrLN/kpVX+FjRkhMKqZxTET3PfjO+x585871S49//rOPfvahZ89cHA0nu8PpuJZpM12n5uTKwu6kRmJGTCkwggKaaOuMrqrMHoiDtGFoCdEYidB8kYuIxRSZRNQs5lkhscWo1HmXU1Z2cyhBO3mW53VdNyEUeZ5Um6hIoJZSSoQOsRBJapxEVQkskyQGZNjaBQso1SAe5PzG+OHre/ff/w4EUEBn2HZOgCiISKgJRKAOSRGCtPOnoCEapqQz4g2gAUZRJG5tALWNikNWRSCnSHuj3VXjn7r/g0cHa5JksdfbbHZ+/TOfHSyvV+ON+dW1i9e7o2k137Fj88V3//h3umNrAtw89YKNK8tynEz15puy40fafOfXYzrwugqrlbOqqD91WI4fkYuXsCjzzUn17IXuW26GwXy6dJVu6xkhqh4srF6M5Tww62kTql7detNe9Y8Hysl2yyZhYmYLq2vv+8Efe98P/piGvWtXr5w7c/aF8xtPPvL5+kufXOuVO5MJMlQhMHFMkWZcSmWHAOCca+FpNWWiLMtaqmmMUVVdliOCiGaZVxMAyzLfxNgOWUDcZgE1MbYiliYEZocATJyagEDeeVVLCgRWOmpCVIBghoQhJscoBlFTv1s+vrH5uevh297z7pIghtiyvVt6TKvtSTEBUIt8TkMMUaTF7ZFEjJhN5OBmICIzUGsVXUDkTJGQ1WEdqzXK/9Ld7z7VWVCflczI+nd/799vgD+SZdM0ygzn1w5vbjw3z+mdH3j/Pe99n+Rerw3T81c9Z5xileed++8EMLLXEy719XaFN4r8942UiN55L1FGUZrS4ZOX5Noury4gqly6Rsz2ksq4wVjmwDHnm7OXJCIm1hCkHkszRpcfOn7rOz/4fX/pF37+gXtvOjlgYaSsk6KoQR1ju/uNMTIzALZV1S6YHTvvffvHqqqIqCiKFJMpEFJKQjjrFImoaeo2VUpEenO9VoCvqlmWiWq7EnbeMzs1jTFmmVfAaVQhn4y8z0SVkVVNTZ3jz1+48vBW+uA7758jSSkS8YweQ7M85tbiIaWUJImaGooCIIthUkxqIpJa2oLORNVq1j5mRIfoiBwAZS7DafUdp+4+sbi2J0Grinv0Tx/7k0e2Nlf6SxOILi91Ui2tHd6sZXFp8Tt++MM210XD5unzLAqMEhp3983Z0gBEk3t9Himvs7BenNyS+OUFuuuWGBpzxEmrx5+XILy6LNubsrtnzoMmwwM2tpodLEkRWlmJKZq8VHSr+++vfHxILzN8QUBCckRMIGqxTqmajrYe/b3fPbq8HFKS1ABxW1IKEEUM0RAlKaELTVKFVoMQgzAxqmRM7RCb5VkbcMxMohpFmhgBzWccU0gheO9DjMjOAIFYzJCpiUFEGV0UDTERkqSEhOxYxAzZkJxz6LA26fni4fMbj4/tp773u25amTf0TH7WUSHUMYolNY0pBpFpDOMmNJJEUusrS8SpHbgIDUmNkpiIyb7XZIymwGqgCITI3iHgicGqAZuC8/i7j3/+D848vbi0LBIcECtO45BIfX/t+370h+duvsnysnlhU68PIXMYqrS80nnrHaaKgKSv+wh4QweGErCav+92WljwVUydjK/tyTOXrdfxSwv6wgWMlVKO+tKEQ4SX2LXggZ3LNyV6nRHozZwrL3z1S/l4u9PtVJNaRFq1j7Tef4iAmFIygGpaEREiti1IiGEymbQHDzsmJmICQnIcU4opee+99zEGZs7zLM+LlFJ7htnsugdVdd6FGNv01IO9bNuAt/zU9nEmjQPO/ujclRcUfumHvmfgNQKZYUqpXRoLmKFF0SalkLRuUh1SMmu32oRkOttLHrg2t5omJDKDqBoVFA8cn42YnXfr3JkfzIemme+Vn77w5L996rFieZHRPJNv04DzYvf61Z/9oe+7/4Pfqd7LblU/fSEjBwCiVDxwL5TFAUfiW1JYrZUOFzm/9x41YzVwHJ+9YNdGtLQEmU/nLpFDuzGf46VmbS+NRX71FfWN/qqv7nr9im7s8U9/cr3AJBJCBEPTlg5KrfEfmKWUTFVV8jxvv3+MwTlXFAUR7R8BhExBUiPJCFW1qqokyXu/fw+mLMv2822FiMy0/VRUaWJwxLCPnLVl3ebXtW5Y/aL3mfOb5wL+0g98f6ZWi1RNrKqqHf1ijKKaRGJKTZQ6xCamOsaY1KzNWU/tXdw2iCKiKu2l2X7EkBTIgNpLn4jyPE8xHcsHWYJB0fnChSc/fv4r5fo6E2fOec/M6B1LbG5e7v70974f+n3FrPrquayKKWdrItxy0p86AkmB3lip0Bs+JxBBJDt+zO66GaraMsKQwqNnUh34yArsDtOVy+QJtaX2zt6h/a8J3rB6QBA0OTAOsNa0xaR9by/HfcTVXo1XrQBCzoWmuvDElzvd3t64ZuebEA0gBInRzDg2SQVS1GgqjNPQxBAyZonRxJqQguy7Hag45Iw9GZooEzvnY4iq2tI1TVJsKk0B1Zg4qQgAeU+InU5pAEEkqnGWT5sAxCKt31aMIpmlJza3npykn/uu70TQxiQKbu7tIiEgiGkSCSGEEOomhJSSWpNiEomSkpkiRcUoYICimkSTKCC3zuxiFFN7v7e/wISIKlrM9Ww0OtkbsIQ/Pfvoxy88VSytOKDcOZ855DYiwijEj33kh/rHjkCWhWcvwZUt8A5CY71u951vmRnyvkFC5zekO0VE1eKBu+PiAlYJmWFzGL7yAroSjx+yi1d1ODSGG+LLWp2zvui7/41ST19W42KAnF186onhheckpZR0r4oK3NTtYpFSSu092Ar2iVjNQowhJZdlRPv7bKJ9UDG1B4yIEHNd1855M4sxHkymWZZ577Isa1v7mJKBpRg7nY6aKthoNCJmZtfaKDRBCpJRSp95fvuD734wL7BJMSps7uyIKRCqQVSJYkkgJI1iIWkQ1dmmD1uHSDUwgBZyaBNiEVH3Kc4H5z8TIRIY5HkJzi812Jsr/92ZL/zxzsV8eZkECCHPvHfsmCnPYhj94o981733vz11i2ZrLzxxzhEJqKsge89bodcBUXjjbcs3KGhWU5eX+Xvvi2Ak6ry3567E56/QYJ5XV+LFSxgjIN2QBGMHeC3iDY4/OHsxvJbJ1ouC/FceWUaqBkBf/PQnoW6qBvemcXNY7Y7GLSW8bYYIsS2CybgKdQxNystSZ+6tsx+qqkxkZqFpUkrOOQRoZ8n2+3jv2yajHQZDCCE0MwWYzLjnqprnWbuk8963rmwhRseUZf4Pzmysnjhdend9Mtmp48WNnWlIBqZmAholBUlViCFJVG1aYN1QkplhjJJSlBRjivtpe3jgDNiaRraynHY2BCQAWlhYnmxvTEfb/+7ZR56MU7+wpIpg5gkcoycoXB6mzUe+7X0//uEPp7kOVik8csYnM89+0sidt2SnT5gIfEPd8DdYWASUkrhj6+6eO1PTKCshhy89axt7sDzwrgjnL86M7K3NaMYbAqu19fqBfbtNbCnJpvgirfnl8p5W6XrjgawgzFlqdj/7u7+/O9ULW8Pre9XOqB7WOprU40ltYKFJQVMjKWiKKSWxmLQVXoQQY0oHXVq7bjvo7pj5IN00RVExZt+efCIiaEESIkpSCSpt4KOoISM5l/mZkFoBDAj13HZznYqTh1f2qun2cLozmoSWvZVagj+oYAjtYsZCTCFGSUnMEliUFGJQxSgSYoxqSUQkmRwcXiT7RlFqagDEkLErB33Z3OzPlS+kKZQlJ2MzAvDem5onNw3T+04d/4Wf/FEdzKMrmi+fo92J5Y6baEvz+XvvfdED/M+ssLTlYIsWD9xlx49Ancyzr9L0kaegCnh4DSLY2fPmLOHMTP1GVGvG0TowzWq95F4Sj/vKwnoVeA3N/s5f/88ff/ghl3Uuj6tr48nOqLq0Odyu0taoub41Gk2nSTUEUbOiKNvNQFM3KUl7Gh3USruAazPPY2hNfJiIEMk5n5LEmJA4ibVQh/Ne9yl2ANDKhBDJAFtEIMRAzAjIvnji2s6R9XUAkDbtLSQDEmmJCRCiRDE1ELNWFwlEapDUYpr9kKRtl4pqAIgi0gJcMjOZ4HZLSEhMBGJrhw5t71w/xt23rJ+OVWRmAyUAZnREnrCqm8P97l/9hR8rVg9rmcVnLsL5TSsyFyQZ0QfewXlm9gq/rG91Yd1g+cj5tz0Y5rrcBCkcbQ7rR88AmD9yWKpKL28x+5Zmia/Gf29hiZeSIA4mylf3Gz7YT5Mrv/LQp+svfv62E/NfvXZ1L5IoCdFuLdeG9U6VNoepiUJAIUhLmwkhMHNMMYQgKu29dnBcgZmm5BAzZgKIMbSfbQfMEMK0CdOmSWpVXYNZlmUAwK41/EBVbZqmFRoRUe58SuKLrIp6JepyfxBTTFGDWAtVkc+SQhOkSapACmTEIakaJAUxNCMVlGRqrZp35sUyexkoqKG1mXJg7XDaug7lWW9peX376WffunK0y6WjDNuzmMh75wnAtJPj/+Znf2r91jusKPXSdnriPLNzQCFUdv9d/tC6SWgDgL+FhfViJpbdAEUZGCGLUL9TvveBBEiikHfs3Ebzlec0A7e+Jlc3ZXubPFu7NTUxkJl5Voua7vvfzdY+qC2yii96Q7RBWq1ppwIYtjawKgD8hT/8xFpJ3/m2O779tmNzHC6PR09v7GzHsFM3m5N6GuK0luu7Y9WgCpaUCCUkMALkpmqapjG14XDUNOHA2DjEWMXQ3tzsWNpZFVRN0KAoimldgUFIqa5rYlIzQvCZNwAVobaDVBNTJAhVtTmqAjpibJJGSe2+r27CtKpikqAaJBloEm2apAamqGpJLMRkCI2kODN5N1ExQzFMhgokqtpuCAAQwHOOAJDsjtvecv7Cc4cjLRfzPnNEmlQNjMg8tTYB8ld//Idve8d9UnTS3rB+5CwrhkxwMqXbbirffgdFRWCAV09WeD1v7ps7sMAIUJI/eSg8eJd89stZnsc8j09ewCLjW4/wkWW5cN0Z2/IgJZmdXG2MXpvNMVssthEkZqAwG4VkP/WuNYRWw5m1Znu8MXOqhy98+Ysn5xf3tndvWejcsbxwYWdyfnd8aXc4bOLGNGw4mM+ztX731Hp/vDsu81zZKOMQY2bMADHEhGIqyFw1gYkkJmQwgyYl730To8w6dEEgZg4hOu8zcg0IE5magYJClETkAPBAlNykJjWxYL81GhG7KsYQQqfMNbTQF2pMIrq/bBYRSEkBzDkGsXb5o2Zp3ykvpdgGXRqQ4Yt5ygiA2E4pYMo333KHZnDhsUd/8uZ3CECHXeE4mokagglkWE8/9hM/9J5v/47UzbGJzRfOQEix4HxcN2sL3ffej/YizmtfQxn6NW9J903O/IZIhkmlfNtdk3Gtjz8Lncypa750Niuy/ORhVldfupQ7pEHfRMlA92cxfDH8V/eDOckObIHwBjj1JZApmCnl5dWnn9y7fGn5lmOjejoxzTT2O/GdS4vNZG53Um3V1eZUdmu9tLd7bbJXsp8v8yOLc3mGSOa9NwmatNMpQ1MLwGhadThDQkeECrXEtn93zokakhdJoIJEzJxSTKZlUYYYGSg0gZ2LKaakxK5lKbbDiXMuz4tmdzqZ1mqa5bmooSqRU6CoAohk7RElIoKIMYiYKfJBqkCMEbF1fSQRM2hVXAT7JdXeyAi4vn78xKmb/uX/+I/u7s0dGiwgubm8KNE1KuSdIcZq8rEf+4Hv+YHvTXNdSjp56Gm3M7UOU5AwmCs/9F4rckrpa1AYbkx/+QYLC7+OjutFBjMbmlr3XW/bGw2L56+FOZ/VKg89E8uOOzTIbEFfuIQ3I/f6FhUB9xeF+627HhTQAU155qR+Q3SgzUJvWqcX4Atnnt7d3Lm0uNDPUwKsJbHzG7uVJ/A53bqwegcYEwr74bQGsac3dzaG1Wq/TDE0IXgCNYgxxSRgkYlbq9aoFppAjqomAEJeFO2vkgBBLERJFkufMVLdxFlfIJZMY1IiTim2q25mNu+nVVVkrGDj6TjPypAUAURFUzRRIjI1BQVE27ffj0laQc4MOzAAA7GDtoEAjQBbbnA7XhBhinL82M23333vJ3773/jh9bljd3nHoNDt9kqX7YKpajUc//Wf/tEf/vEfinN9dFx97ll/ZdcK52JS8/kHH+SFPkZrY76+tn/sN9dj3TCivVaK6kHcDJoB0+DbHowr824UxTswDZ/9il7ZgcEcrAzkzEUdjsBTm7iALxK22lyRmWwXZrlLBw4iuj8VGoJiu9I2AdCnv/L4+lw2mo7PXhuOaiFED5gxCmhelo2kSUzTIKGOOeJ8J58rsnHQkFQFYogAWOSFqImahOSIq6ZmohAjOmJ25BwgmYFzWQsEJEBAh+RCEk06nk4n0xqUCB0igxEReedbaotICikAuzm2gckLm+MqhWkdJnWsg2zs7NYxqkFSTabtUiKaBdFkWEcJUZqY6hCjaBsVLqKiSkxg4JAcO0fsiZkEjW45fcex07d9/Lf/bX3uK4cHJSN3ik6vU8z1B0wMovV48ksf+YGf/skfTf0euyw9cpbObUjpzAwDuG9/hz+0RlGAvvlEtzdhKrwRrUQQw26n8z3vk0GPJwnYF+NUPfSUbo15YSFbWtbnLupoD5kUCVquI9E+rfTGdaS9qkugzSRzCmxgzfNPPXlqqXtyaY5cdnV37+zWzrm9UaSMfaEqjJzlRURsYkCiEJMChZiSggGUZSmSmhBUJS/yXq87m6oAPHInK0A0pei9DyEAWEqpqqoqNEBABilGYiqKouiUQVMCDTHlmdf9lR8ixhAzchKjN3zrUtGM9sZRR9N6XIXdcTWehghu0khs/SkNo1gUTQp1CCHGJBqiirYTIhy4/ba3Mzs2A+89IJRF/567HlhYXv393/6X4zNfOjboxhAdcZnnc91OmTMhNGH8N37yI7/0Mz8bFwfsOvWXnrfnLqfSoxpW0d731uzmExpNCd+senBv1jdCAyDEZNTv5d//nulv/gnXdVVysVfXn/1q+Z630FIPvMDTF+DkYVhZlKBksxTKG9fUL6ZM7eczHoQJ7jcu6jIebV0fX76APhvX9U1Lnar2e0FrtQsb2x6pV2YZpzxzufdAECXOFaUY1E00Be9dCI2J9Oa6ohqaJCmA45SSZbmIxpgAwLlM1bzPqskEAPr9/u5wZKIOSZklSRQRaRDRMSeVOoTWWY8Qm9DkPm/qWkSR89OL/vbN0dmdyfJg0EgtMcaoo2njmHLnzKTtnZKoJKnqhn2mklqRUbvJRmt1fMhEgOCYk4gqHT50/MjRmy5fufjQH//WvE2OLHSjYVZ0ukXBzM5BRoU0zS///E/8zEd/PHa6jnr1V8/aM5cgc2SAk0bec0/3ntshysxr61tXWK9yv75aMtMrY9AMzQgwSbawCN/33ua3PolN3XScm4TqM18uH7wDVvp2FOX8VReiHlmGcJB4aC9lvds+njXjr+1/zgBBVR2VF144F7a3lm49NhyPkqT5fumrIGYxcaNWS5rElCenyQBZVfsdGFc1AtTTutPxquJ9VlWRCBEhqWqQzHsBS6omoqqQpC2a0nMd0mg0KX1e5sVwNIyWyqxE4CLzTQreeUI/aZq6bszMRJ3jqq6d9wqaJE2n4US3+/T5axsJuoO5EGOM2kRpokSe+V+ogqqJSohWOAI0RFJVQwBGM1QFx2imhJhS6s+vnjx9E6F7+HN/ePGJRw71szKbq1PsO1/FppPnmaNCkUL9f/hrf/m93/+h1CsIXPPFZ+Lzl733YIbTyt5xR/e+t0CaaRThW1pY3/TtipYU11by73tf8zt/Wkxi0yuySaw/80R+/218dIk5r69ezVLEo4cEEZPdGHNxEGq9b5vyKo4SAP75p570Eou8SDGKxkkdmQlV0FHP0aC3MJ5ME1CTBAzqpi5RUwitfMg7r4oqEmJi5rL0jDyeVAdGSG33XRQFM5uIqPossyTJdFJXSbXb6YymUzKXgo1DHYIwclHkk8kYEQUMiNg5JlICidEcLffL959a/dS5KxvVtst7YIrAKpAQWodckQRm0NowWUs1NmZuGTjt2lXBiKg7t7iyejjPOmef+MrZpx7rSnXH8kJjSUVz50HNMXey3ILicnf1vadO3XtCOvNkWD96Bs5e80VmCDhu7K23lu++z0QR3/wqePMLq92IchQ9tJJ/+L31f/gM1DEWnNep+tyT+YO35ceWi8Pr8dqmnT3Pp46K9xQjzozJDxIjzfYBB1NDpoOPtKfb+WeeXJnvjZppFWo0KDslg8RoCuB9Pp3WhlwW3qcg0TzlOTtmIsIsz6ZV7XIfRXPPiFjVYmA+y/IsG4/H3vuW+tfEqE2Te4eqiorkGDDE4PNc1cCgLPMYkrfMe59i2t3bLfJCVNG7aVMjQOsxrmpVnRqzBZLvPrH21PbO9enOVrCmOyiKnmISUwRgIAONZshE3MrWDmJXFciyrOj2B735xRTCM098eevCs10Np3pl6RfHGjUmR15SyrqdPGCX3MKhhWPvv6245ah25hCg+cIZeOGaFZlTkKaR+2/vPvA2S4aob2Kr/WJhoX0TTdVrwvQKhJgEV9aK73t/87ufwqZqcudiip95Ut9+U37Tera+Gq5fl6887W45iUWpksjQsPXMnYE0LZupDUnf5zArI4NMts89P59TbCpLWhYlaJpUTVEUHrGOiZizzKlBE7TIMjHLilwMck9iEVSnTYMGDr1IUlF0HEVEjNkzc13XnbKkJI45VnXeK1VNRDKfYYTYNLVqwS7G0EhqqTaM0OmUIYokAUZiZiQGnjZV0SmMgkzqZKApnBr0j/Tg6nj65JVzrr/Y6/XZOcesRK1tTj0eOYbcd4BIwVQFDEygmVSj3VH9+OM63Vr0eDTPO1mvloQxMZjzDgEyV0STna3tU9935KbvvhePrUKva9O6fuSMu7wXepmLplWw+2/vPvh2EEW0r1tVL8vDfp1ww7fgKrwB8KCour5U/MD7649/loYjKhyo2EPPxFGN957w64dkczs8/bw/doiWBpBmD5wQ29biZajJLBbQ43hra3jl2rp3JuIzX6eIYkW3W1UVE/f7/aqatl76c3O9uqkNrUlx3MhyNy+8ixrm+92mrofTKZMrvEfv6hgAgJgI0Tk3raqYUsF5NKvqAOxikqSS+yw3qyUxUBMbInbsQoyDTkcAgsQyy4eTERNFgHZPpDElmRHCTLR0Pgfx3dyxXZ/sbVzZFnbkMiRkE5eSB2jGwwmzITJiSsKmOShLKjzOeSwHpSkQOVDz7BgRBTpZFg3UJFTVz/3MR779Zz/MK8vQKeP2qH7oqWy7jt3cB5Um4rvv7bz9bpUZ4vN6nsc3WlXf2sJqVTUuKiwt5D/0/up3P+OubEDPk/n0xDmeTvVtt9L6at4twpXrvDflk4eMiNJ+Muk+z+aAvrKvyfZb167WO7t+fWBASVIURUC1xhTAUlPXLdOrZcA1KWVZFmJskg16HTCZhsjTWhGLvCCkKJKqir1z7JLEPPMZICEyuzzLVQzZ+7xIWnkkUx3WFRG1PrfTpsl85piZeTKZIGAIocxzRIyqUbTM8+lkAoDsnQPrZRRiBJTCu5uL8u7VpYt7w3ETxk00xSLPKGOXcZCkQA6ZADRjAEXSEJmIwZQNhYEBmUhVfOa9owxpZ3f78KG1j37sP3vnD/6wdDx411zckoef7U5TKD2HpGL4oXeUt99qyQDlG4gX+XM+sV7MiwdFBhBx3V73+99f/eGn/dkr1ikhL+D57Wb6pH/7Tbg4l/siXLoiTzybnTqmvYKizaQSM/hqJnltMVKg/PqFCz0pfZbVsSGD+V5X1GKMnHlGa+NSxTSEQERELsRUFKV3DkFEXacoW+IvmGZ53vrbkgGKAtK0ahxQiqKMdR1EVBlGwyF5VzWhYM/sM5+NhyPnXe7ZOWR0VYghpm63O5nWuXNNjNMQO0UxqaZAJCHVIXryppFJM3YZ+Ii2Oxkdmyu6S4sbTRVDEnCjSZN5N0EF9mzQ+uqklGpD9pgjp5SQ0CHknj3zHOVJIpFubu68990P/vx/+ktLd90TPDt2zZMX41PnvWAoc2wqJaTveo+/6QS03vRvvK96Q/oX/pu//DffvMvvNT6ACAKW+fymE3UIeul6jpnmGQ+nzZVNzDNa7vNCDxXk6gYngH7XwEDtJf+QNoVblYvyq3/66eJCtTzXqWSoJoCuZaowk0pSVSSc1nVRFNKmv6e4M2kubw9PLPbJUpMky7Lc+xmckSTLc8esKsjkiZsY2nxbbQXcqqKCRN75jF3dNG2edKfTITBJKaQURfIsTym1h4qYJrXM+xYBLl3mgIKkLM+JGVo3ZUIwy302bSpyuNDrZmS9nDOmzDlEIMZOkWmKROBACyYCzRxlngih08k9UebccLhXMvzsz330ox/7WOfk8ZQV2Gj9yDPyzCV2bA6xrrXbc9/7PnfiCAVB+vpN1TdQSX+2V+HBY2VlVQPuvP+Bar4fP/dlHy2WGYdkn3u62Rr6e0+51WXudPTKRpoM/dEj2CksCs6Sxmbs21kijdnKwpGbTqyPnq2nuKlgzOydDyEwe1Vpz6o2gjmm1C+zjSoQ46DIDTSkGGIkNWPUJJn3u+PRoNsz1cLlJoZEhm2cKjERApBRXdeUF+ooy3MAILImhAwx83mjdRvyxsyTqvbM3rkmaYyBiEMK7do9gaBwlMREeZFFSXOdkpCixIIxxVhV1eLc3E5dley66hqwkGInY0UEodxnk1DPEhgcQRIDq+r63jtv/5mP/tyx+9+VOjl5tis70y+ddXsVZx4AcBTjyePdb3sHzZUpyRsV23zDb2/miYWv/U5tAqkZKvpDK7o2Hy9v0KRCz8aA14bp+i7NdXipC4MuTlK6vmGq3OsC+1ZkTwgzgCcrh7tb5/7o4beeeuv8YKWu62kzkv2Z2QzqZsqO8qxoYsoAxAxMzu9MRHEpzxIkRpxWFbGbK0oVrVLMvSMgBXAAu6MxEJY+jym1hjlIyM555xlNEOqmtXTzqhqTjqras4+WQKyuQ60pYwa1zDk1ZabM+xjTtGm886ogAJ5ciKmOsUqpSWGpMxdiQrBuniGYd85UFMw7KrxrDzBSIwB0RKq93BVM4+Hu4vzij/zIj/7sX/nY4PZbUycHpOaJC81jZ7hOmDunArXGt9za++D9VHhIyohGswbja5xGN37q6x5aBx4I38qr8HXc0kZqltxgAU4fDtu7bmNXPZLLcFyHyxsASItz1O9gnuHWruxsoWfrZgCAIm2REvN4Ov6n/+hXv+OudywuLvXnVstiYXt7yyhxpinVznlmz8jJ1JFLknxRPnXx+qHBYG1hfjQddX0xmOubyripk6QMXeY4xMCETYh5UWTOj8bjvCgOuF/turBOCiqlp0alrpuC/aSuDEBiMmg9z9lnXmJs5fKoigZRpZuVmctSkiDCiCJihp2sZCQkc0Cimmfe0SwznYmI2BM7hNg0GTEjqUmrl6jqpgrxXe99z//ir/y127/zAzLflyLDjUn90LPywlVPbJlh1TTOufe/o3vfXQCEyYBe9Ft8nXfc678K/7wLq+23kFDU5wXfcqJiootbBCaFd9Hs4kbaHMJc6QcDGPRQKG1c572KyhIKj2aqSkX55GNf/vu/9o97nL/vgXcxZgudpcPzxxbmlibjGplGw7FrrfcIHDuTsD1tLu1VNy3Pq6Q8LxxzFRsRQ4Q8z1XFgBxhtyy2RxPP3MmLoGk/58JEUowJEcvcG0ATpczLsijqGOoY+2XHEIGUCZkohggIjp2qdnzOSJUlEZ02TVBl4rmiU4W6kgSEJuKdQ0IEyLxrgVnvPQFkWa6SQLXX7UhoRAU9haoaTae33n7nR3/hF7/7pz/qTxzVoovi0hOXw5fPQlVTnhGATeu0slx+5/uLU0cgCaABvbF2qWVcvZ4Z8Ma/eSN74M+6sAgADYGgjRAujqzD2lK4tsV7U8wcOA9703jhuiTlwRwOuq7oSFXHK9ewjtAtjT1nnU/+fz7xyBPPfOnahTgavvPm2xgpd91BNr+yeHJ99ebFwdHM9dnn3XxgQmU+vzusvMtX+73peAxgScQMet0OE02mEzV1zCnFJkV2ro4xpMjsvPOIJpqI2DknkjLvVc05H0IIIqPxuMxzA6tjaO2ZiKgN6hXVmBIgBomMVOaZqtVRJnXsZr5TFk2KGVHhSNs5Iy/aKTjFVEtqTCWmKtSNJEIkgKqpdobj1eX1n/iZn/uxX/zFtXvfEsscfGaX96ovnqFzG0RkHrlJEczfcWfxne9ygx4GuYFT+QYuslciWPBqsOIrLdBe/B9NAn+Ob2rmWeq6+dyX6KvPITkpKAspRdFBx999Ak8ddmAwncadbZo0NtfNbj35t/5X/+Vv/d6nOgv97Yvnvuv4Xf/L7/nRmw+dSHVTxQY8GbZ5kAnBhsOdfn9w+crFTi9vmtHmcKuxuLl5RWw6iXsEkjvfGngSuyZF550BeueqqnLOExqBRTHnXIyxHQYRIYkBQIwREJio5GwSGiBEM+f8ZDppVflVXTtmEfHOTYJMqljkRUypTk0vz0JMAE4ZHbOJgGmZZ6BK7ENKjmhaVWYQmjCeTg6trn7gQ9/91u/4juLUzepImGE4jk9eiJc3nRJkziWAqoori/7db3NH17G1p6FvsEN6rTnxDXRdf46FhQCKAArGBAjp7Pn681/0G3vY8UaOmiSm7vAS3XXCrc4jaJpM0tUtz+nf/Ovf/Ke/+8c7Qbnw473tgcD7Tt/5vXc+8Nbjp0tmIGZfRNUYa2ZMMZL3dQzOSFVc6Sb11Gf09FOPY6aXr78wnlzjnOukdVM77wiAicXMOS91lTkO1rrHKhFlWdY0dRJDQOedpISASFg1TZ5noOa9TyKtcnrmHAGghrVgE6JzNEkJknXLXFMazPW3RiNEZEQwdUS591VVG/O0qQm1nkyXV4+879s+9Pb3vS+/+aSVpZCDaUxnLjfPXcQ6YJ4xMjTRHOHtt2T33cF5DkHbicnw60jjX2dhvaG//+dfWC+iqQaoZp61qacPfQW+esapQZGjAdS15A5PrftbjvCgi6YwHNK4Ovf4k3/4qc9/4iuPn93bmUhK43G3kZPLa3euHr1j9cix5bXlQb9blAtzfa/siwKYWQFSCnUN3qlZVVVzc/3NrQ11ujO6dmXj+WEz3Ni51qS65XV288xznkIiRwBoagptEm5i5CrFxcF8NZ40Ejo+iykYs4oBEDs2s7quW9Y8Io3rMA7JIRe5G00rE+11e+O6ytibWZ7ne8Pd5cFckGiiMQQwmIZ48uab3/b2B+9+57u6J09pt2OOMEC8vB2fOk87E/We2DhGiyKH1vhdby0OrYKYqOIsxOcNgOlvtML+AhTWSxBQJkQMVzbrhx9zFza8Y808Jw2WMPN8bJVvWsOFPkriGGG4t/XkmU9+7ou/98gXv3z1ytCCxaQqbIBmfeLC59286JflSre/WPYO9+ZOLK0eG6wcXljqdDuQZTJpRCAiSAqOsEphOB42Mj13+ZkI9e7uZhOn7KCqxlVVlZ0STBAp84WBJBVGYvZ1bEpmQkhIKSkSI2KK0TnXhNDmkQnypG7KotNMpwlU1Rz5IIHQGhEzkiT9HCXGTt7nrDh0/PgD73vf6be9ndbWNffCTFHSxc3m+au8NWHAlLGLGmKDncK/5U6+5xaHHkSB7GsF0LyRo+gNbQb/oy6sljGhaMAMJvXT5+JjT7ndPfYOmFTNUoIi80eW6fQqLs2BAocA1ThcvPjkZ7/y+49+5TOXzl8bj5ApY6dEIhJCMEtRpE6RDXLFDvm13twti+tvOXL6nhM3nV4/WmQFWKq1SUkceY0aqqmR1RrqerixeQUzuHbtUh3G02Yk0jRxGlTmys6kaRggL7MUg2OKYiEKERvYgZVISlHMnHOSYHc6ISCfZ1FkXMe1uXkP4PNOv5z3li0srPTmB4dOHzt068nuqWMw3zX2yt6qKJc207krtDVGxJRnTkzrJhDyLTdl99/pe10U1ZbB9ua9yL+x6vyPpnl/dUKXGjhilLppvvqsfvUMjidYZoSMQZJE7TheX3InV3G5C8wkxk2AqzvXnj3zha989QvPPfvE1Svb05qcZ+cJCQicKiIng2kI06aajsexaQauPLm8/sDJm99z+u6bDx1ZnOsCISikSTOdTLnI2vx3Zm5CjWiVxOsbV3rd/NKVF4rMT5taIVLBuzu7DJI0htCG4SYmA4PQxDY9rCi6aOh8huaczw15aXHdJ9Za5hcWXOG783ODU+v58jwsldYvNPMIaOMYL++k56/gXsVIkLkEkldNQA8njmRvvY3Xl8nAkhgDmn0raFVvfvP+DZ+Eb+K/BomUMI6G8sUz6ewLblqRcylzPlhMUR3wUp9Prvq1BejkhuCSwrTS67tXX3jhyWee/Mrz5567ev3S3m4tmmcF5+CASFGAFEFEQtNsVZPxtKKga525u9eOvuX46buPHjs9v7aQdQAhaSLvVW0ynRqgK8vYBDZCsKJbTqfTKOKLfLizC6KDwdz2zmaW500Us+TZQdROp6yaUMzNx6ZxzE09LbKymtQL84OGBXu+XO/goMyW56GXp25O7CGq7Izk/IZd2eVpNKaYMaliHVnRjqzR227n44cYAGILGuOfQZfyF2kqfD1vAsBEiiA7w/DEs/DMeZxO0TM5b2AWEwLCfIcPL9PKPC52sWAz4dDAuILt8e6la2fOvXDm/Lmnr168tLc7amID4Nk5moWugSEKTEPYnIx2hqMmhAJwKe+eXjly55GTJ7q9m1fX1w4f6VPmo6LzCGiiwKSESlTHSuvakjB6U1NMpGYKruwaY0whyzKJAklDSqLinarHYqHLy4Vfm6fFLhYFZoU5j2phPNXLe3J5G3ZGEEVzD444qTYBkfHYYbr3Zn9kjZAsGqK+Vkm97FD45hvzg2/4db/Vi4jXf+SF1V6NqACOAEGGk+a55/WZ8257GD1k5Ig4ilBMKUNa6PL6Mq0OaK6UjJwpS4JaYTwN1za2rl0/f+ny2auXL2xtbY7G05TGMURJzhGaWTIA1yQdxzBumtG0qqoKYiyIV/pzhzvzxwcrhzr99f7CkaXVlfl+r8g7WZ73+2laZ8CY5wBgTZKmbppaW0aoipjkpaccapRioZctdmGxA3MFd3qU5coOBGzSpM29+voWXdmlaVJmcixOMSXXqHRKOnbY33ma11cIwFprOPo6UTYvo31+w3y9b+Ae+4txYt34eAEAmQEhhpDOXdSnL+j1TV834Clm7AQgmpmmjN18j9f6tNyHQQdzD0ScFDVCFWESbDza293a2drc3ty5trV9dW9rczQeTpppCNO6qYO0CSpNDHt1mISQNIUoTRPrGEjECxa56zrfI+6VvUFZLub5XNnpl53VucHxlaXjq8triytFWdCcs9Jxr8Ruif0udgosc3AOjU3ExnXcGtq1YdoZ2bhGA824DZ9ydUJFW+zT6aPuluO0MM8A1j5T3+jEBzfGMnxDrJjX+YV/0Qpr/1ErzoTlCiDXt9IzL6QXLtNwzIhaMCG3oLOCmWfXLWmpZwtdWOpiWQJzG2nGqpASxABNgGktk2k1nVTVZDwejUfT3eFoOK1HdTOZNtO6biQ2SZuYZh5UjgmYmRxBp1PMFb6fu44vF+YXlpcXFhYWyn6/WJijIscsgywH75AAjEzNqqnuVLo7jbtj3ZvwJLCCeQYmAYMYKYjmHg6t8M0nsxNHqfAGgFFbq+k3t2H6VvTQB0faX7TCmnX1ZoZkCI4AQCehuXxFz57HK5s4bYjBciZ2ZqCiEAVMIWfslTrf8YMuLHSpW1qemXOEwK3/viqqggZIEZKBKICAACSBFABwlrJHBIyABEzACOSAHBACO2AHxIAGqC3bFRSwMa2iDSeyO4y7Ix1XNI7UUr4cqkNSo5hMUuLMLSzYTev+xFFeXCAAaCO98OsD6G8UqXoT4dBX7cDM7C9iYb3yfiRAVIC0M9FLV9KFK7a9w1UwiEhg7NCAkqlaMlMwdkxljr2CuiV0C+jm1M0pz9AxMBrP+jqyNoe+tboEADAVQwRCRSMAAmppzZDaIFmAmDQmmwYY1TBptAo6rrRuLAqKEhKBAzYjoYSWxJKoZ1scuGPrdPwQrS17dmBgrY3fm+CG/5Kqep1GMa9zPPw6kOSfZWF9iyCM9neGAOqYAcxAhpNwbTNevoJXr9NwYikRIrEzYnMEqqh2kEeKiOgYPJt3kHtwBI4595gTMINjzL0dJHqaWUqkaElMVGOyKBAixAQxWh2hiZakdXQ0opYnCLONoWoyjJHMtFPq8qI/vJodWcGlRfSu3ciTAL6q8Pw/mu3IKwH6/9kWFgK0drmkBmBGSMStT5LUUXf35PoGXt3QraFMKorJwNAxeUfYUqFaTNagtZ7RmaGQtncuAs8SvAEY0QDFDNjUSAwIW7JvG8xihEZkRDRzXFKIgqKgoJmnssSFOV2Y55VFXu1zb65NsTJTE2Xg1k/TXt3X5//HCuvNva3f5EMMYHZgABhAaqINR7a7LVtD253A3tTqGlJANVJtIa22lZqFqczYlmAH7JMXXSoQVKkVpO07i5up05k7tBKg85SV0s1wcQ6XF3hxEecH3MkP0HETbf1tYOZo+E0t+L6xlvyN0mYQ8XVekX/Be6zX2Ye1Zm7IwACzLCiDJup0auOJjWodj2E8hXFtVa2xhpAsqQGygpkmTPtH48yMF1qnHEIARUZwTK6gPNeOp16P5+aoX0KvR72ulRnyvoBBAdqeDMHepI3vN/MdXvVLXgay39ic3VjE+Fpppq+nsP78tzpv6mOwfTs3A0MEgrY3378KAchMk0ASiklCVE2QVEMiibM0jf3URWkpf5kjcpR582zeo+PWCQj3nQnBwHRmbnmglHwtcPxNBC2/9ne7cYh7nYX1sn3ON1tY/7M9wvY7M5g529ygf5xZz7+xZ3nm+jwz8LD9rJcX2Qb4rWyaXqtGX6tu3iit79VbqFfA+i8am32LCutbes79GR2ibzjnB7/5Oe7Nwi1f5fD4Rq/IV0okXv+bg///26u9Hv8CdpLfqpfcG6qtg4fx/wWOsXNHBfHwSwAAAABJRU5ErkJggg=="
+# ── PDF ────────────────────────────────────────────────────
 
 def generar_pdf(restaurante, ciudad, resultado):
     from reportlab.lib.pagesizes import A4
@@ -217,7 +226,6 @@ def generar_pdf(restaurante, ciudad, resultado):
     from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_JUSTIFY
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, KeepTogether
     from reportlab.lib.colors import HexColor
-    import io, base64 as b64lib
 
     ROSA=HexColor('#E8527A'); ROSA_L=HexColor('#FDEEF3'); ROSA_M=HexColor('#F7A8BF')
     MARRON=HexColor('#5C3D2E'); MARRON_L=HexColor('#F5EDE8')
@@ -259,8 +267,7 @@ def generar_pdf(restaurante, ciudad, resultado):
             Paragraph('<b>%.1f</b>'%val,st('bv',fontSize=8,alignment=TA_RIGHT))]],
             colWidths=[38*mm,f,bw-f,12*mm],
             style=TableStyle([('VALIGN',(0,0),(-1,-1),'MIDDLE'),('LEFTPADDING',(0,0),(-1,-1),0),
-                ('RIGHTPADDING',(0,0),(-1,-1),0),('TOPPADDING',(0,0),(-1,-1),1),
-                ('BOTTOMPADDING',(0,0),(-1,-1),1)]))
+                ('RIGHTPADDING',(0,0),(-1,-1),0),('TOPPADDING',(0,0),(-1,-1),1),('BOTTOMPADDING',(0,0),(-1,-1),1)]))
 
     def accion_block(n, que, quien, plazo, metrica):
         c=[ROJO,AMBER,VERDE][n-1]
@@ -286,17 +293,16 @@ def generar_pdf(restaurante, ciudad, resultado):
     S=[]
     S+=[Spacer(1,5*mm)]
 
-    # HEADER con logo si existe
+    # HEADER con logo
     if LOGO_B64:
         try:
             from reportlab.platypus import Image as RLImage
-            logo_bytes = b64lib.b64decode(LOGO_B64)
-            logo_buf = io.BytesIO(logo_bytes)
+            logo_buf = _io.BytesIO(_b64.b64decode(LOGO_B64))
             logo_img = RLImage(logo_buf, width=26*mm, height=26*mm)
             S+=[Table([[
                 logo_img,
-                Paragraph('ChefPanda', st('bn',fontName='Helvetica-Bold',fontSize=22,leading=26,textColor=MARRON)),
-                Paragraph('Gestion de reputacion\ndel restaurante', st('tg',fontSize=8,textColor=ROSA,leading=11,alignment=TA_RIGHT)),
+                Paragraph('ChefPanda',st('bn',fontName='Helvetica-Bold',fontSize=22,leading=26,textColor=MARRON)),
+                Paragraph('Gestion de reputacion\ndel restaurante',st('tg',fontSize=8,textColor=ROSA,leading=11,alignment=TA_RIGHT)),
             ]],colWidths=[30*mm,TW-30*mm-50*mm,50*mm],style=TableStyle([
                 ('VALIGN',(0,0),(-1,-1),'MIDDLE'),('LEFTPADDING',(0,0),(-1,-1),0),
                 ('RIGHTPADDING',(0,0),(-1,-1),0),('TOPPADDING',(0,0),(-1,-1),0),
@@ -317,7 +323,6 @@ def generar_pdf(restaurante, ciudad, resultado):
     S+=[Paragraph('%s  |  %s'%(ciudad,date.today().strftime('%B %Y')),st('sub',fontSize=10,textColor=MUTED))]
     S+=[Spacer(1,3*mm)]
     S+=[HRFlowable(width='100%',thickness=2,color=ROSA,spaceAfter=3*mm)]
-
     titular=resultado.get('titular','Analisis de reputacion online')
     S+=[Table([[Paragraph(titular,st('tit',fontName='Helvetica-Bold',fontSize=10,leading=15,
         textColor=MARRON,backColor=MARRON_L,borderPadding=(8,10,8,10)))]],
@@ -326,57 +331,52 @@ def generar_pdf(restaurante, ciudad, resultado):
             ('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),0)]))]
     S+=[Spacer(1,4*mm)]
 
-    # KPIs — puntuaciones reales
-    ps=resultado.get('pandascore',50)
-    ps30=resultado.get('pandascore_estimado_30dias',ps+10)
+    # KPIs
+    ps=resultado.get('pandascore',50); ps30=resultado.get('pandascore_estimado_30dias',ps+10)
     tend=resultado.get('tendencia','estable')
-    tend_sym={'mejora':'+','deterioro':'-','estable':'=','descendente_preocupante':'↓'}.get(tend,'=')
-    kpi_rows=[
-        [Paragraph('PandaScore',    st('kl',fontSize=7,textColor=MUTED,alignment=TA_CENTER)),
-         Paragraph('En 30 dias',    st('kl2',fontSize=7,textColor=MUTED,alignment=TA_CENTER)),
-         Paragraph('Tendencia',     st('kl3',fontSize=7,textColor=MUTED,alignment=TA_CENTER)),
-         Paragraph('Fecha',         st('kl4',fontSize=7,textColor=MUTED,alignment=TA_CENTER))],
-        [Paragraph('<font size="22" color="#E8527A"><b>%d</b></font>'%ps,  SC),
-         Paragraph('<font size="22" color="#2D7A4F"><b>%d+</b></font>'%ps30, SC),
-         Paragraph('<font size="16" color="#E8890C"><b>%s</b></font>'%tend_sym, SC),
-         Paragraph('<font size="11" color="#5C3D2E"><b>%s</b></font>'%date.today().strftime('%d/%m/%y'),SC)],
-        [Paragraph('score actual',  st('ks',fontSize=7,textColor=MUTED,alignment=TA_CENTER)),
-         Paragraph('con mejoras',   st('ks2',fontSize=7,textColor=MUTED,alignment=TA_CENTER)),
-         Paragraph('esta semana',   st('ks3',fontSize=7,textColor=MUTED,alignment=TA_CENTER)),
-         Paragraph('analisis',      st('ks4',fontSize=7,textColor=MUTED,alignment=TA_CENTER))],
-    ]
+    tend_sym={'mejora':'+','deterioro':'-','estable':'='}.get(tend,'=')
     cw4=TW/4
+    kpi_rows=[
+        [Paragraph('PandaScore',st('kl',fontSize=7,textColor=MUTED,alignment=TA_CENTER)),
+         Paragraph('En 30 dias',st('kl2',fontSize=7,textColor=MUTED,alignment=TA_CENTER)),
+         Paragraph('Tendencia',st('kl3',fontSize=7,textColor=MUTED,alignment=TA_CENTER)),
+         Paragraph('Fecha',st('kl4',fontSize=7,textColor=MUTED,alignment=TA_CENTER))],
+        [Paragraph('<font size="22" color="#E8527A"><b>%d</b></font>'%ps,SC),
+         Paragraph('<font size="22" color="#2D7A4F"><b>%d+</b></font>'%ps30,SC),
+         Paragraph('<font size="16" color="#E8890C"><b>%s</b></font>'%tend_sym,SC),
+         Paragraph('<font size="11" color="#5C3D2E"><b>%s</b></font>'%date.today().strftime('%d/%m/%y'),SC)],
+        [Paragraph('score actual',st('ks',fontSize=7,textColor=MUTED,alignment=TA_CENTER)),
+         Paragraph('con mejoras',st('ks2',fontSize=7,textColor=MUTED,alignment=TA_CENTER)),
+         Paragraph('esta semana',st('ks3',fontSize=7,textColor=MUTED,alignment=TA_CENTER)),
+         Paragraph('analisis',st('ks4',fontSize=7,textColor=MUTED,alignment=TA_CENTER))],
+    ]
     S+=[Table(kpi_rows,colWidths=[cw4]*4,style=TableStyle([
         ('ALIGN',(0,0),(-1,-1),'CENTER'),('VALIGN',(0,0),(-1,-1),'MIDDLE'),
         ('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5),
         ('LEFTPADDING',(0,0),(-1,-1),4),('RIGHTPADDING',(0,0),(-1,-1),4),
         ('BACKGROUND',(0,0),(-1,0),MARRON),('TEXTCOLOR',(0,0),(-1,0),WHITE),
-        ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
-        ('BACKGROUND',(0,1),(-1,2),GRIS),
+        ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),('BACKGROUND',(0,1),(-1,2),GRIS),
         ('LINEAFTER',(0,0),(-2,-1),.3,BORDE),('BOX',(0,0),(-1,-1),.5,BORDE)]))]
     S+=[Spacer(1,3*mm)]
 
-    # Puntuaciones reales por plataforma
+    # S01 Puntuaciones reales
     punts_reales=resultado.get('puntuaciones_reales',{})
-    if any(v and v!='Sin datos' for v in punts_reales.values()):
-        plats=[]
-        for plat,val in punts_reales.items():
-            if val and val!='Sin datos':
-                plats.append([Paragraph('<b>%s</b>'%plat.replace('_',' ').title(),st('pl',fontSize=8)),
-                    Paragraph(str(val),st('pv',fontSize=8,fontName='Helvetica-Bold',textColor=VERDE))])
+    if any(v and 'Sin datos' not in str(v) for v in punts_reales.values()):
+        S+=hdr('01','PUNTUACIONES REALES EN PLATAFORMAS')
+        plats=[[Paragraph('<b>%s</b>'%k.replace('_',' ').title(),st('pl',fontSize=8)),
+                Paragraph(str(v),st('pv',fontSize=8,fontName='Helvetica-Bold',textColor=VERDE))]
+               for k,v in punts_reales.items() if v and 'Sin datos' not in str(v)]
         if plats:
-            S+=hdr('01','PUNTUACIONES REALES EN PLATAFORMAS')
             S+=[Table(plats,colWidths=[50*mm,TW-50*mm],style=TableStyle([
                 ('VALIGN',(0,0),(-1,-1),'TOP'),('TOPPADDING',(0,0),(-1,-1),5),
                 ('BOTTOMPADDING',(0,0),(-1,-1),5),('LEFTPADDING',(0,0),(-1,-1),8),
                 ('BACKGROUND',(0,0),(-1,-1),GRIS),('BOX',(0,0),(-1,-1),.5,BORDE),
                 ('LINEBELOW',(0,0),(-1,-2),.3,BORDE)]))]
-            S+=[Spacer(1,2*mm)]
+        S+=[Spacer(1,2*mm)]
 
-    # S2 FORTALEZAS Y PROBLEMAS
+    # S02 Fortalezas y problemas
     S+=hdr('02','FORTALEZAS Y AREAS DE MEJORA')
-    fortalezas=resultado.get('fortalezas_top3',[])
-    problemas=resultado.get('problemas_top3',[])
+    fortalezas=resultado.get('fortalezas_top3',[]); problemas=resultado.get('problemas_top3',[])
     col_w=(TW-4*mm)/2
     S+=[Table([[Paragraph('<b>FORTALEZAS</b>',st('fh',fontName='Helvetica-Bold',fontSize=9,textColor=VERDE)),
                 Paragraph('<b>AREAS DE MEJORA</b>',st('ph',fontName='Helvetica-Bold',fontSize=9,textColor=ROJO))]],
@@ -384,9 +384,8 @@ def generar_pdf(restaurante, ciudad, resultado):
             ('BACKGROUND',(1,0),(1,0),ROJO_L),('TOPPADDING',(0,0),(-1,-1),5),
             ('BOTTOMPADDING',(0,0),(-1,-1),5),('LEFTPADDING',(0,0),(-1,-1),8),
             ('LINEAFTER',(0,0),(0,-1),1,BORDE)]))]
-    maxf=max(len(fortalezas),len(problemas),1)
     rows=[]
-    for i in range(maxf):
+    for i in range(max(len(fortalezas),len(problemas),1)):
         f=fortalezas[i] if i<len(fortalezas) else ''
         p=problemas[i]  if i<len(problemas)  else ''
         rows.append([
@@ -399,25 +398,23 @@ def generar_pdf(restaurante, ciudad, resultado):
         ('LINEAFTER',(0,0),(0,-1),.5,BORDE),('LINEBELOW',(0,0),(-1,-2),.3,BORDE),
         ('BOX',(0,0),(-1,-1),.5,BORDE)]))]
 
-    # S3 PUNTUACIONES POR CATEGORIA
+    # S03 Puntuaciones categoria
     S+=hdr('03','PUNTUACIONES POR CATEGORIA')
-    puntuaciones=resultado.get('puntuaciones',{})
     for lbl,key in [('Calidad de la comida','calidad_comida'),('Servicio de sala','servicio'),
                     ('Ambiente y decoracion','ambiente'),('Relacion calidad-precio','precio'),
                     ('Gestion online y respuestas','gestion_online')]:
-        v=puntuaciones.get(key,3.0)
+        v=resultado.get('puntuaciones',{}).get(key,3.0)
         try: v=float(v)
         except: v=3.0
         col=VERDE if v>=4.0 else (AMBER if v>=3.0 else ROJO)
         S+=[bar_row(lbl,v,col),Spacer(1,1*mm)]
 
-    # S4 LO QUE DICEN LOS CLIENTES
+    # S04 Reseñas reales
     resenas=resultado.get('resenas_destacadas',[])
     if resenas:
         S+=hdr('04','LO QUE DICEN LOS CLIENTES — RESENAS REALES')
         for res in resenas[:2]:
-            tipo=res.get('tipo','')
-            col_tipo=VERDE if tipo=='positiva' else ROJO
+            tipo=res.get('tipo',''); col_tipo=VERDE if tipo=='positiva' else ROJO
             S+=[Table([[
                 Paragraph('<font color="white"><b>%s</b></font>'%tipo.upper(),
                     st('rt',fontSize=7,fontName='Helvetica-Bold',alignment=TA_CENTER,textColor=WHITE)),
@@ -435,7 +432,7 @@ def generar_pdf(restaurante, ciudad, resultado):
                 ('SPAN',(0,0),(0,-1))]))]
             S+=[Spacer(1,2*mm)]
 
-    # S5 SILENCIOS
+    # S05 Silencios
     silencios=resultado.get('silencios_oportunidades',[])
     if silencios:
         S+=hdr('05','OPORTUNIDADES OCULTAS EN LOS SILENCIOS')
@@ -454,7 +451,7 @@ def generar_pdf(restaurante, ciudad, resultado):
                 ('LEFTPADDING',(1,0),(2,0),8),('BACKGROUND',(0,0),(0,0),GRIS),
                 ('LINEBELOW',(0,0),(-1,-1),.3,BORDE),('LINEAFTER',(0,0),(-2,-1),.3,BORDE)]))]
 
-    # S6 PLAN DE ACCION
+    # S06 Plan de accion
     S+=hdr('06','PLAN DE ACCION — 3 PASOS PARA ESTA SEMANA')
     accion=resultado.get('accion_urgente','')
     if accion:
@@ -464,12 +461,11 @@ def generar_pdf(restaurante, ciudad, resultado):
                 ('TOPPADDING',(0,0),(-1,-1),0),('BOTTOMPADDING',(0,0),(-1,-1),0),
                 ('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),0)]))]
         S+=[Spacer(1,3*mm)]
-    plan=resultado.get('plan_semana',[])
-    for i,paso in enumerate(plan[:3]):
+    for i,paso in enumerate(resultado.get('plan_semana',[])[:3]):
         S+=[accion_block(i+1,paso.get('accion',''),paso.get('responsable',''),
                          paso.get('dia',''),paso.get('metrica',''))]
 
-    # S7 RESPUESTAS
+    # S07 Respuestas
     respuestas=resultado.get('respuestas_sugeridas',[])
     if respuestas:
         S+=hdr('07','RESPUESTAS LISTAS PARA PUBLICAR')
@@ -478,7 +474,7 @@ def generar_pdf(restaurante, ciudad, resultado):
             S+=[Paragraph('"%s"'%resp,SQ)]
             S+=[Spacer(1,3*mm)]
 
-    # S8 OPORTUNIDADES
+    # S08 Oportunidades
     oportunidades=resultado.get('oportunidades_estrategicas',[])
     if oportunidades:
         S+=hdr('08','OPORTUNIDADES ESTRATEGICAS')
@@ -494,8 +490,7 @@ def generar_pdf(restaurante, ciudad, resultado):
                 ('LEFTPADDING',(1,0),(1,0),8),('BOX',(0,0),(-1,-1),.5,BORDE)]))]
             S+=[Spacer(1,2*mm)]
 
-    # CTA eliminado del informe interno
-
+    # BUILD
     tmp=tempfile.NamedTemporaryFile(suffix='.pdf',delete=False)
     doc=SimpleDocTemplate(tmp.name,pagesize=A4,
         leftMargin=16*mm,rightMargin=16*mm,topMargin=20*mm,bottomMargin=16*mm)
@@ -523,17 +518,18 @@ def generar_pdf(restaurante, ciudad, resultado):
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     await update.message.reply_text(
-        "ChefPanda Admin listo\n\n"
+        "ChefPanda Admin\n\n"
         "CLIENTES\n"
         "/nuevo_cliente Nombre | Cocina | Ciudad\n"
-        "/listar — ver todos los clientes\n"
-        "/ver ID — ficha completa\n"
-        "/estado — resumen general\n\n"
-        "DATOS\n"
-        "/resenas ID — pegar resenas reales\n"
-        "/urls ID URL_google — guardar URL\n\n"
+        "/listar\n"
+        "/ver ID\n"
+        "/estado\n\n"
         "ANALISIS\n"
-        "/analizar ID — busca online + analisis + PDF\n\n"
+        "/analizar ID          — solo si hay scrape nuevo\n"
+        "/analizar ID forzar   — regenera aunque no haya cambios\n"
+        "/analizar ID fecha    — resetea fecha y fuerza regeneracion\n\n"
+        "DATOS\n"
+        "/urls ID URL_google   — guardar URL de Google Maps\n\n"
         "GESTION\n"
         "/pausar ID / /activar ID"
     )
@@ -541,17 +537,16 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def nuevo_cliente(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     try:
-        texto=" ".join(ctx.args)
-        partes=[p.strip() for p in texto.split("|")]
+        partes=[p.strip() for p in " ".join(ctx.args).split("|")]
         if len(partes)<3:
             await update.message.reply_text("Formato: /nuevo_cliente Nombre | Cocina | Ciudad")
             return
-        nombre,cocina,ciudad=partes[0],partes[1],partes[2]
-        res=sb_insert("restaurantes",{"nombre":nombre,"tipo_cocina":cocina,"ciudad":ciudad,"plan":"pro","activo":True})
+        res=sb_insert("restaurantes",{"nombre":partes[0],"tipo_cocina":partes[1],"ciudad":partes[2],"plan":"pro","activo":True})
         rid=res[0]["id"]
         await update.message.reply_text(
-            f"Cliente anadido: {nombre}\nCocina: {cocina} | Ciudad: {ciudad}\nID: {rid}\n\n"
-            f"Usa /analizar {rid} para el primer analisis"
+            f"Cliente anadido: {partes[0]}\nID: {rid}\n\n"
+            f"Paso 1: python scrape.py {rid}\n"
+            f"Paso 2: /analizar {rid}"
         )
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
@@ -559,14 +554,16 @@ async def nuevo_cliente(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def listar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     try:
-        clientes=sb_get("restaurantes","activo=eq.true&order=id")
+        clientes=sb_get("restaurantes","activo=eq.true&order=id",CAMPOS_RESTAURANTE)
         if not clientes:
             await update.message.reply_text("No hay clientes activos.")
             return
         msg="Clientes ChefPanda\n\n"
         for c in clientes:
-            ultimo=c.get("ultima_analisis") or "nunca"
-            msg+=f"{c['id']} - {c['nombre']}\n   {c.get('tipo_cocina','?')} | {c.get('ciudad','?')} | Ultimo: {ultimo}\n\n"
+            scrape  = c.get('ultima_actualizacion_resenas') or 'nunca'
+            analisis= c.get('ultima_analisis') or 'nunca'
+            msg+=f"{c['id']} - {c['nombre']} ({c.get('ciudad','')})\n"
+            msg+=f"   Scrape: {scrape} | Analisis: {analisis}\n\n"
         await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
@@ -575,9 +572,8 @@ async def estado(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     try:
         clientes=sb_get("restaurantes","activo=eq.true")
-        total=len(clientes)
         await update.message.reply_text(
-            f"Estado ChefPanda\n\nClientes activos: {total}\nIngresos: {total*99} EUR/mes"
+            f"Estado ChefPanda\n\nClientes: {len(clientes)}\nIngresos: {len(clientes)*99} EUR/mes"
         )
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
@@ -585,46 +581,22 @@ async def estado(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_ver(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     if not ctx.args:
-        await update.message.reply_text("Uso: /ver ID")
-        return
+        await update.message.reply_text("Uso: /ver ID"); return
     try:
         rid=int(ctx.args[0])
-        clientes=sb_get("restaurantes",f"id=eq.{rid}")
+        clientes=sb_get("restaurantes",f"id=eq.{rid}",CAMPOS_RESTAURANTE)
         if not clientes:
-            await update.message.reply_text(f"No existe ID {rid}")
-            return
+            await update.message.reply_text(f"No existe ID {rid}"); return
         c=clientes[0]
-        resenas=c.get('resenas_raw','') or ''
-        resenas_info=f"{len(resenas)} chars guardados" if resenas else "Sin resenas guardadas"
-        url_g=c.get('url_google','') or 'No configurada'
+        try: n=len(sb_get("resenas",f"restaurante_id=eq.{rid}"))
+        except: n=0
         await update.message.reply_text(
             f"Ficha: {c['nombre']}\n"
-            f"Cocina: {c.get('tipo_cocina','?')}\n"
-            f"Ciudad: {c.get('ciudad','?')}\n"
-            f"Plan: {c.get('plan','pro')}\n"
+            f"Cocina: {c.get('tipo_cocina','?')} | Ciudad: {c.get('ciudad','?')}\n"
+            f"Ultimo scrape:   {c.get('ultima_actualizacion_resenas','nunca')}\n"
             f"Ultimo analisis: {c.get('ultima_analisis','nunca')}\n"
-            f"URL Google: {url_g}\n"
-            f"Resenas: {resenas_info}"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-async def cmd_resenas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    if not ctx.args:
-        await update.message.reply_text("Uso: /resenas ID\nLuego pega las resenas en el siguiente mensaje.")
-        return
-    try:
-        rid=int(ctx.args[0])
-        clientes=sb_get("restaurantes",f"id=eq.{rid}")
-        if not clientes:
-            await update.message.reply_text(f"No existe ID {rid}")
-            return
-        ctx.user_data['esperando_resenas_id']=rid
-        ctx.user_data['esperando_resenas_nombre']=clientes[0]['nombre']
-        await update.message.reply_text(
-            f"Pega ahora las resenas de {clientes[0]['nombre']}.\n"
-            "Copia directamente de Google, TripAdvisor o donde sea."
+            f"Resenas en BBDD: {n}\n"
+            f"URL Google: {c.get('url_google','no configurada')[:60] if c.get('url_google') else 'no configurada'}"
         )
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
@@ -632,180 +604,213 @@ async def cmd_resenas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_urls(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     if not ctx.args or len(ctx.args)<2:
-        await update.message.reply_text("Uso: /urls ID URL_google\nEjemplo: /urls 1 https://maps.google.com/...")
-        return
+        await update.message.reply_text("Uso: /urls ID URL_google"); return
     try:
-        rid=int(ctx.args[0]); url=ctx.args[1]
-        sb_update("restaurantes",rid,{"url_google":url})
-        await update.message.reply_text(f"URL guardada para ID {rid}")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    rid=ctx.user_data.get('esperando_resenas_id')
-    if not rid: return
-    nombre=ctx.user_data.get('esperando_resenas_nombre','')
-    texto_nuevo=update.message.text or ''
-    if not texto_nuevo.strip(): return
-    try:
-        clientes=sb_get("restaurantes",f"id=eq.{rid}")
-        existentes=clientes[0].get('resenas_raw','') or '' if clientes else ''
-        separador=f"\n\n--- Anadidas {date.today()} ---\n" if existentes else ''
-        actualizadas=existentes+separador+texto_nuevo
-        sb_update("restaurantes",rid,{"resenas_raw":actualizadas})
-        ctx.user_data.pop('esperando_resenas_id',None)
-        ctx.user_data.pop('esperando_resenas_nombre',None)
-        await update.message.reply_text(
-            f"Resenas guardadas para {nombre}\n"
-            f"Total: {len(actualizadas)} chars\n\n"
-            f"Usa /analizar {rid} para lanzar el analisis."
-        )
+        sb_update("restaurantes",int(ctx.args[0]),{"url_google":ctx.args[1]})
+        await update.message.reply_text(f"URL guardada para ID {ctx.args[0]}")
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
 async def analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     if not ctx.args:
-        await update.message.reply_text("Uso: /analizar ID")
-        return
+        await update.message.reply_text("Uso: /analizar ID [forzar|fecha]"); return
     try:
-        rid=int(ctx.args[0])
-        clientes=sb_get("restaurantes",f"id=eq.{rid}")
+        rid    = int(ctx.args[0])
+        flag   = ctx.args[1].lower() if len(ctx.args) > 1 else ""
+        forzar = flag in ("forzar", "fecha")
+
+        clientes = sb_get("restaurantes", f"id=eq.{rid}", CAMPOS_RESTAURANTE)
         if not clientes:
-            await update.message.reply_text(f"No existe ID {rid}")
-            return
-        await update.message.reply_text(f"Lanzando analisis de {clientes[0]['nombre']}...")
-        await lanzar_analisis(rid,clientes[0],update)
+            await update.message.reply_text(f"No existe ID {rid}"); return
+        c = clientes[0]
+
+        if flag == "fecha":
+            sb_update("restaurantes", rid, {"ultima_analisis": None})
+            await update.message.reply_text("Fecha reseteada. Regenerando...")
+
+        ultimo_scrape   = c.get('ultima_actualizacion_resenas')
+        ultimo_analisis = c.get('ultima_analisis')
+
+        if not ultimo_scrape:
+            await update.message.reply_text(
+                f"No hay resenas scrapeadas para {c['nombre']}.\n\n"
+                f"Ejecuta primero:\npython scrape.py {rid}"
+            ); return
+
+        if not forzar and ultimo_scrape and ultimo_analisis:
+            if ultimo_analisis >= ultimo_scrape:
+                await update.message.reply_text(
+                    f"No hay resenas nuevas desde el ultimo analisis.\n"
+                    f"Ultimo scrape:   {ultimo_scrape}\n"
+                    f"Ultimo analisis: {ultimo_analisis}\n\n"
+                    f"Usa /analizar {rid} forzar para regenerar."
+                )
+                # Intentar recuperar ultimo PDF guardado
+                try:
+                    pdfs = sb_get("pdfs", f"restaurante_id=eq.{rid}&order=fecha.desc&limit=1",
+                                  "id,fecha,pdf_base64")
+                    if pdfs and pdfs[0].get('pdf_base64'):
+                        pdf_bytes = _b64.b64decode(pdfs[0]['pdf_base64'])
+                        await update.message.reply_document(
+                            document=_io.BytesIO(pdf_bytes),
+                            filename=f"ChefPanda_{c['nombre'].replace(' ','_')}_cached.pdf",
+                            caption=f"Ultimo informe: {pdfs[0].get('fecha','?')}"
+                        )
+                except Exception as e:
+                    print(f"Error recuperando PDF cache: {e}")
+                return
+
+        await update.message.reply_text(f"Analizando {c['nombre']}...")
+        await lanzar_analisis(rid, c, update)
+
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
 async def lanzar_analisis(rid, restaurante, update):
-    nombre=restaurante['nombre']
-    ciudad=restaurante.get('ciudad','')
-    cocina=restaurante.get('tipo_cocina','')
-    resenas_manuales=restaurante.get('resenas_raw','') or ''
-    url_google=restaurante.get('url_google','') or ''
+    nombre = restaurante['nombre']
+    ciudad = restaurante.get('ciudad','')
+    cocina = restaurante.get('tipo_cocina','')
 
-    historico=sb_get("analisis",f"restaurante_id=eq.{rid}&order=fecha.desc&limit=3")
-    hist_txt=""
+    historico = sb_get("analisis", f"restaurante_id=eq.{rid}&order=fecha.desc&limit=3",
+                       "semana,pandascore,titular")
+    hist_txt = ""
     if historico:
-        hist_txt="HISTORICO:\n"+"".join(f"- Semana {h.get('semana')}: Score {h.get('pandascore')}\n" for h in historico)
+        hist_txt = "HISTORICO:\n" + "".join(
+            f"- Semana {h.get('semana')}: Score {h.get('pandascore')}\n" for h in historico)
 
-    # Paso 1: buscar resenas reales online
-    contexto_web=await buscar_resenas_reales(nombre,ciudad,update)
+    # Paso 1: leer resenas de Supabase
+    await update.message.reply_text("Leyendo resenas de la base de datos...")
+    contexto_resenas, tiene_resenas = construir_contexto_resenas(rid, nombre, ciudad)
 
-    await update.message.reply_text(f"Analizando datos encontrados...")
+    if not tiene_resenas:
+        await update.message.reply_text(
+            f"No hay resenas en BBDD para {nombre}.\n"
+            f"Ejecuta: python scrape.py {rid}"
+        ); return
 
-    # Paso 2: analisis completo con Claude
-    texto=analizar_con_claude(nombre,ciudad,cocina,contexto_web,resenas_manuales,hist_txt)
-    texto_limpio=texto.replace("```json","").replace("```","").strip()
+    # Paso 2: contrastar KPIs web
+    await update.message.reply_text("Verificando KPIs publicos...")
+    kpis_web = contrastar_kpis_web(nombre, ciudad)
 
-    # Parsear JSON con fallback de reparacion
+    # Paso 3: analisis Claude
+    await update.message.reply_text("Generando analisis...")
+    texto = analizar_con_claude(nombre, ciudad, cocina, contexto_resenas, kpis_web, hist_txt)
+    texto_limpio = texto.replace("```json","").replace("```","").strip()
+
+    # Parsear JSON con fallback
     try:
-        resultado=json.loads(texto_limpio)
-    except Exception as e:
+        resultado = json.loads(texto_limpio)
+    except:
         try:
-            reparado=texto_limpio
-            if reparado.count('"')%2!=0: reparado+='"'
-            reparado+=']'*max(0,reparado.count('[')-reparado.count(']'))
-            reparado+='}'*max(0,reparado.count('{')-reparado.count('}'))
-            resultado=json.loads(reparado)
-            print("JSON reparado OK")
-        except Exception as e2:
+            r = texto_limpio
+            if r.count('"') % 2 != 0: r += '"'
+            r += ']' * max(0, r.count('[') - r.count(']'))
+            r += '}' * max(0, r.count('{') - r.count('}'))
+            resultado = json.loads(r)
+        except Exception as e:
             await update.message.reply_text(f"Error parseando respuesta: {e}\n\n{texto_limpio[:400]}")
             return
 
-    # Guardar en Supabase
-    hoy=date.today()
-    semana=hoy.isocalendar()[1]
-    sb_insert("analisis",{"restaurante_id":rid,"semana":semana,"año":hoy.year,
-        "informe_texto":texto,"pandascore":resultado.get("pandascore",0),
-        "titular":resultado.get("titular",""),"resumen_telegram":resultado.get("resumen_telegram","")})
-    sb_insert("pandascore_historico",{"restaurante_id":rid,"semana":semana,
-        "año":hoy.year,"score":resultado.get("pandascore",0)})
-    sb_update("restaurantes",rid,{"ultima_analisis":str(hoy)})
+    # Guardar analisis en Supabase
+    hoy = date.today()
+    semana = hoy.isocalendar()[1]
+    try:
+        sb_insert("analisis", {
+            "restaurante_id": rid, "semana": semana, "año": hoy.year,
+            "informe_texto": texto, "pandascore": resultado.get("pandascore", 0),
+            "titular": resultado.get("titular",""),
+            "resumen_telegram": resultado.get("resumen_telegram","")
+        })
+        sb_insert("pandascore_historico", {
+            "restaurante_id": rid, "semana": semana, "año": hoy.year,
+            "score": resultado.get("pandascore", 0)
+        })
+        sb_update("restaurantes", rid, {"ultima_analisis": str(hoy)})
+    except Exception as e:
+        print(f"Error guardando analisis: {e}")
 
-    # Resumen en Telegram
-    t=resultado.get('tendencia','estable')
-    t_e={"mejora":"Mejora","deterioro":"Bajando","estable":"Estable",
-         "descendente_preocupante":"Bajando"}.get(t,t)
-    problemas="\n".join(["  - "+str(p) for p in resultado.get("problemas_top3",[])])
-    fortalezas="\n".join(["  + "+str(f) for f in resultado.get("fortalezas_top3",[])])
-    titular=str(resultado.get('titular','')).replace('_',' ').replace('*',' ').replace('`',' ')
-    accion=str(resultado.get('accion_urgente','')).replace('_',' ').replace('*',' ')
+    # Resumen Telegram
+    t   = resultado.get('tendencia','estable')
+    t_e = {"mejora":"Mejora","deterioro":"Bajando","estable":"Estable"}.get(t, t)
+    problemas  = "\n".join(["  - "+str(p) for p in resultado.get("problemas_top3",[])])
+    fortalezas = "\n".join(["  + "+str(f) for f in resultado.get("fortalezas_top3",[])])
+    titular    = str(resultado.get('titular','')).replace('_',' ').replace('*',' ').replace('`',' ')
+    accion     = str(resultado.get('accion_urgente','')).replace('_',' ').replace('*',' ')
+    punts      = resultado.get('puntuaciones_reales',{})
+    punts_txt  = "".join(f"  {k.replace('_',' ').title()}: {v}\n"
+                         for k,v in punts.items() if v and 'Sin datos' not in str(v))
 
-    # Puntuaciones reales encontradas
-    punts=resultado.get('puntuaciones_reales',{})
-    punts_txt=""
-    for plat,val in punts.items():
-        if val and val!='Sin datos':
-            punts_txt+=f"  {plat.replace('_',' ').title()}: {val}\n"
-
-    msg=(
-        "Analisis completado: "+nombre+"\n\n"
-        "PandaScore: "+str(resultado.get('pandascore','?'))+"/100  "+t_e+"\n"
-        "En 30 dias: "+str(resultado.get('pandascore_estimado_30dias','?'))+"/100\n\n"
+    msg = (
+        "Analisis completado: " + nombre + "\n\n"
+        "PandaScore: " + str(resultado.get('pandascore','?')) + "/100  " + t_e + "\n"
+        "En 30 dias: " + str(resultado.get('pandascore_estimado_30dias','?')) + "/100\n\n"
     )
-    if punts_txt:
-        msg+="Puntuaciones reales:\n"+punts_txt+"\n"
-    msg+=(
-        titular+"\n\n"
-        "Fortalezas:\n"+fortalezas+"\n\n"
-        "Problemas:\n"+problemas+"\n\n"
-        "Accion urgente:\n"+accion+"\n\n"
-        "Generando PDF..."
-    )
+    if punts_txt: msg += "Puntuaciones:\n" + punts_txt + "\n"
+    msg += (titular + "\n\nFortalezas:\n" + fortalezas +
+            "\n\nProblemas:\n" + problemas +
+            "\n\nAccion urgente:\n" + accion +
+            "\n\nGenerando PDF...")
     await update.message.reply_text(msg)
 
-    # Generar y enviar PDF
+    # Generar PDF
     try:
-        pdf_path=generar_pdf(nombre,ciudad,resultado)
-        with open(pdf_path,'rb') as f:
-            await update.message.reply_document(
-                document=f,
-                filename=f"ChefPanda_{nombre.replace(' ','_')}_{hoy}.pdf",
-                caption=f"Informe completo ChefPanda - {nombre}"
-            )
+        pdf_path = generar_pdf(nombre, ciudad, resultado)
+        with open(pdf_path, 'rb') as f:
+            pdf_bytes = f.read()
         os.unlink(pdf_path)
+
+        # Guardar PDF en Supabase para cache
+        try:
+            sb_insert("pdfs", {
+                "restaurante_id": rid,
+                "fecha":          str(hoy),
+                "semana":         semana,
+                "año":            hoy.year,
+                "pdf_base64":     _b64.b64encode(pdf_bytes).decode()
+            })
+            print(f"PDF guardado en BBDD para restaurante {rid}")
+        except Exception as e:
+            print(f"Error guardando PDF en BBDD: {e}")
+
+        # Enviar PDF por Telegram
+        await update.message.reply_document(
+            document=_io.BytesIO(pdf_bytes),
+            filename=f"ChefPanda_{nombre.replace(' ','_')}_{hoy}.pdf",
+            caption=f"Informe ChefPanda - {nombre}"
+        )
     except Exception as e:
-        await update.message.reply_text(f"Resumen enviado. Error generando PDF: {e}")
+        await update.message.reply_text(f"Error generando PDF: {e}")
 
 async def pausar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    if not ctx.args:
-        await update.message.reply_text("Uso: /pausar ID"); return
+    if not ctx.args: await update.message.reply_text("Uso: /pausar ID"); return
     try:
         sb_update("restaurantes",int(ctx.args[0]),{"activo":False})
         await update.message.reply_text(f"Cliente {ctx.args[0]} pausado.")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+    except Exception as e: await update.message.reply_text(f"Error: {e}")
 
 async def activar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    if not ctx.args:
-        await update.message.reply_text("Uso: /activar ID"); return
+    if not ctx.args: await update.message.reply_text("Uso: /activar ID"); return
     try:
         sb_update("restaurantes",int(ctx.args[0]),{"activo":True})
         await update.message.reply_text(f"Cliente {ctx.args[0]} activado.")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+    except Exception as e: await update.message.reply_text(f"Error: {e}")
 
 # ── MAIN ──────────────────────────────────────────────────
 
 def main():
-    app=Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",         start))
     app.add_handler(CommandHandler("nuevo_cliente", nuevo_cliente))
     app.add_handler(CommandHandler("listar",        listar))
     app.add_handler(CommandHandler("estado",        estado))
     app.add_handler(CommandHandler("ver",           cmd_ver))
-    app.add_handler(CommandHandler("resenas",       cmd_resenas))
     app.add_handler(CommandHandler("urls",          cmd_urls))
     app.add_handler(CommandHandler("analizar",      analizar))
     app.add_handler(CommandHandler("pausar",        pausar))
     app.add_handler(CommandHandler("activar",       activar))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     print("ChefPanda Bot arrancado...")
     app.run_polling()
 
