@@ -9,9 +9,8 @@ import urllib.request as ur
 import urllib.parse as up
 import urllib.error as ue
 from datetime import date, datetime
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Any, List
 
-from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -19,7 +18,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # CONFIG
 # =========================================================
 
-load_dotenv()
+BOT_TOKEN        = os.environ["BOT_TOKEN"]
+ADMIN_CHAT       = os.environ["ADMIN_CHAT_ID"]
+SUPABASE_URL     = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_KEY     = os.environ["SUPABASE_KEY"]
+ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
+PDF_BUCKET       = os.environ.get("SUPABASE_PDF_BUCKET", "")
 
 BOT_TOKEN        = os.environ["BOT_TOKEN"]
 ADMIN_CHAT       = os.environ["ADMIN_CHAT_ID"]
