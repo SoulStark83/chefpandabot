@@ -38,8 +38,6 @@ def generar_pdf(restaurante: str, ciudad: str, resultado: dict, kpis: dict = Non
     VERDE_L  = HexColor('#E8F5EE')
     ROJO     = HexColor('#C0392B')
     ROJO_L   = HexColor('#FDECEA')
-    AMBER    = HexColor('#E8890C')
-    AMBER_L  = HexColor('#FEF3E2')
     GRIS     = HexColor('#F7F5F3')
     GRIS_M   = HexColor('#E8E4E0')
     BORDE    = HexColor('#E0D5D0')
@@ -58,10 +56,6 @@ def generar_pdf(restaurante: str, ciudad: str, resultado: dict, kpis: dict = Non
     S_BODY  = st('body', leading=15, alignment=TA_JUSTIFY, spaceAfter=4)
     S_CTR   = st('ctr', alignment=TA_CENTER)
     S_MUTED = st('muted', fontSize=7.5, leading=11, textColor=MUTED)
-    S_QUOTE = st('quote', fontName='Helvetica-Oblique', fontSize=8.5, leading=13,
-                 textColor=HexColor('#1A4A2A'), backColor=VERDE_L,
-                 borderPadding=(5, 8, 5, 8))
-
     def sec_hdr(num, title):
         return [
             Spacer(1, 4 * mm),
@@ -200,64 +194,58 @@ def generar_pdf(restaurante: str, ciudad: str, resultado: dict, kpis: dict = Non
         n_pos = sents.get('positivo', 0)
         n_neu = sents.get('neutro', 0)
         n_neg = sents.get('negativo', 0)
-        bw_sent = TW
-        w_pos = bw_sent * (n_pos / total_res)
-        w_neu = bw_sent * (n_neu / total_res)
-        w_neg = bw_sent * max(n_neg / total_res, 0)
-        # Asegurar que suman TW
-        w_neg = bw_sent - w_pos - w_neu
-
-        sent_bar = []
-        if w_pos > 0:
-            sent_bar.append(
-                Table([[Paragraph(f'{pct_pos}% positivas',
-                                  st('sb', fontSize=7.5, textColor=WHITE,
-                                     alignment=TA_CENTER))]],
-                      colWidths=[w_pos],
-                      style=TableStyle([('BACKGROUND', (0, 0), (-1, -1), VERDE),
-                                        ('TOPPADDING', (0, 0), (-1, -1), 3),
-                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 3)]))
-            )
         pct_neu = round(n_neu / total_res * 100)
-        if w_neu > 0:
-            sent_bar.append(
-                Table([[Paragraph(f'{pct_neu}% neutras',
-                                  st('sb2', fontSize=7.5, textColor=NEGRO,
-                                     alignment=TA_CENTER))]],
-                      colWidths=[w_neu],
-                      style=TableStyle([('BACKGROUND', (0, 0), (-1, -1), GRIS_M),
-                                        ('TOPPADDING', (0, 0), (-1, -1), 3),
-                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 3)]))
-            )
         pct_neg = round(n_neg / total_res * 100)
+
+        # Calcular anchos exactos que sumen TW
+        w_pos = round(TW * n_pos / total_res, 2)
+        w_neu = round(TW * n_neu / total_res, 2)
+        w_neg = round(TW - w_pos - w_neu, 2)
+
+        cells, widths, bg_colors = [], [], []
+        if w_pos > 2:
+            cells.append(Paragraph(
+                f'<font color="white">{pct_pos}% positivas</font>',
+                st('sb', fontSize=7.5, alignment=TA_CENTER)))
+            widths.append(w_pos)
+            bg_colors.append(VERDE)
+        if w_neu > 2:
+            cells.append(Paragraph(
+                f'{pct_neu}% neutras',
+                st('sb2', fontSize=7.5, alignment=TA_CENTER, textColor=MUTED)))
+            widths.append(w_neu)
+            bg_colors.append(GRIS_M)
         if w_neg > 2:
-            sent_bar.append(
-                Table([[Paragraph(f'{pct_neg}% negativas',
-                                  st('sb3', fontSize=7.5, textColor=WHITE,
-                                     alignment=TA_CENTER))]],
-                      colWidths=[w_neg],
-                      style=TableStyle([('BACKGROUND', (0, 0), (-1, -1), ROJO),
-                                        ('TOPPADDING', (0, 0), (-1, -1), 3),
-                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 3)]))
-            )
-        if sent_bar:
-            widths = [t._colWidths[0] for t in sent_bar]
-            S += [Table([sent_bar], colWidths=widths,
-                        style=TableStyle([('LEFTPADDING', (0, 0), (-1, -1), 0),
-                                          ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-                                          ('TOPPADDING', (0, 0), (-1, -1), 0),
-                                          ('BOTTOMPADDING', (0, 0), (-1, -1), 0)]))]
+            cells.append(Paragraph(
+                f'<font color="white">{pct_neg}% negativas</font>',
+                st('sb3', fontSize=7.5, alignment=TA_CENTER)))
+            widths.append(w_neg)
+            bg_colors.append(ROJO)
+
+        if cells:
+            # Ajustar último ancho para cubrir exactamente TW
+            widths[-1] = TW - sum(widths[:-1])
+            ts = TableStyle([
+                ('TOPPADDING', (0, 0), (-1, -1), 4),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                ('LEFTPADDING', (0, 0), (-1, -1), 2),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 2),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ])
+            for idx, bg in enumerate(bg_colors):
+                ts.add('BACKGROUND', (idx, 0), (idx, 0), bg)
+            S += [Table([cells], colWidths=widths, style=ts)]
 
         # Alertas rápidas
         alertas = []
         if criticas > 0:
             alertas.append(Paragraph(
-                f'<font color="#C0392B"><b>⚠ {criticas} reseñas críticas (≤2★)</b></font>',
+                f'<font color="#C0392B"><b>! {criticas} resenas criticas (2 estrellas o menos)</b></font>',
                 st('al', fontSize=8, spaceAfter=2)
             ))
         if sin_resp > 0:
             alertas.append(Paragraph(
-                f'<font color="#E8890C"><b>↩ {sin_resp} reseñas requieren respuesta</b></font>',
+                f'<font color="#E8890C"><b>{sin_resp} resenas requieren respuesta del propietario</b></font>',
                 st('al2', fontSize=8, spaceAfter=2)
             ))
         if alertas:
