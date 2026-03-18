@@ -8,6 +8,8 @@ from config.settings import ADMIN_CHAT
 
 
 def is_admin(update: Update) -> bool:
+    if not update.message:
+        return False
     return str(update.effective_chat.id) == ADMIN_CHAT
 
 

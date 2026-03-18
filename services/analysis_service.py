@@ -77,18 +77,28 @@ def guardar_oportunidades(analisis_id: int, rid: int, resultado: dict):
     sb_delete_where("analisis_oportunidades", f"analisis_id=eq.{analisis_id}")
     filas = []
     for op in ops_raw:
-        descripcion = safe_text(op.get("descripcion"))
+        # El nuevo formato devuelve strings; el antiguo devolvía dicts
+        if isinstance(op, str):
+            descripcion = safe_text(op)
+            area = "general"
+            extra = {}
+        else:
+            descripcion = safe_text(op.get("descripcion"))
+            area = safe_text(op.get("area")) or "general"
+            extra = {
+                "impacto_pct_min": op.get("impacto_pct_min"),
+                "impacto_pct_max": op.get("impacto_pct_max"),
+                "confianza":       safe_text(op.get("confianza")) or None,
+                "evidencia":       op.get("evidencia") or {},
+            }
         if not descripcion:
             continue
         filas.append({
-            "analisis_id":     analisis_id,
-            "restaurante_id":  rid,
-            "area":            safe_text(op.get("area")) or "general",
-            "descripcion":     descripcion,
-            "impacto_pct_min": op.get("impacto_pct_min"),
-            "impacto_pct_max": op.get("impacto_pct_max"),
-            "confianza":       safe_text(op.get("confianza")) or None,
-            "evidencia":       op.get("evidencia") or {},
+            "analisis_id":    analisis_id,
+            "restaurante_id": rid,
+            "area":           area,
+            "descripcion":    descripcion,
+            **extra,
         })
     if filas:
         sb_insert("analisis_oportunidades", filas)
