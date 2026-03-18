@@ -380,6 +380,18 @@ def construir_contexto_analizadas(rid: int, nombre: str, ciudad: str):
     sent_count = Counter(r.get("sentimiento") for r in resenas if r.get("sentimiento"))
     criticas = sum(1 for r in resenas if r.get("es_critica"))
     sin_responder = sum(1 for r in resenas if r.get("requiere_respuesta"))
+    con_respuesta = sum(1 for r in resenas if r.get("tiene_respuesta"))
+
+    # ── PandaScore calculado en Python (no lo inventa Claude) ──
+    # 50% nota media · 30% % positivas · 20% % respondidas
+    pct_positivas   = sent_count.get("positivo", 0) / total if total else 0
+    pct_respondidas = con_respuesta / total if total else 0
+    nota_norm       = (nota_media / 5.0) if nota_media else 0.5
+    pandascore = round(
+        nota_norm       * 50 +
+        pct_positivas   * 30 +
+        pct_respondidas * 20
+    )
 
     # Dimensiones: suma y conteo
     dim_scores: dict = {}
@@ -461,10 +473,10 @@ def construir_contexto_analizadas(rid: int, nombre: str, ciudad: str):
             ctx += f"[{nota_str}{r.get('autor','?')} – {fecha}] {resp}\n"
             ctx += f"\"{truncate(safe_text(r.get('texto')), 300)}\"\n\n"
 
-    return ctx, True, {"total": total, "media": nota_media}
+    return ctx, True, {"total": total, "media": nota_media, "pandascore": pandascore}
 
 
-def generar_informe_consultor(nombre: str, ciudad: str, cocina: str, contexto: str, hist_txt: str) -> str:
+def generar_informe_consultor(nombre: str, ciudad: str, cocina: str, contexto: str, hist_txt: str, pandascore: int = 50) -> str:
     prompt = f"""Actúa como un consultor experto en experiencia de cliente en restauración.
 
 Tu objetivo no es solo analizar reseñas, sino detectar patrones que un dueño de restaurante normalmente no ve cuando lee las opiniones una a una.
@@ -477,6 +489,7 @@ IMPORTANTE:
 - USA SOLO datos reales basados en los datos proporcionados.
 
 RESTAURANTE: {nombre} | COCINA: {cocina} | CIUDAD: {ciudad}
+PANDASCORE (calculado): {pandascore}/100
 {hist_txt}
 
 {contexto}
@@ -484,7 +497,7 @@ RESTAURANTE: {nombre} | COCINA: {cocina} | CIUDAD: {ciudad}
 Responde SOLO con un JSON válido con esta estructura exacta, sin texto adicional:
 
 {{
-  "pandascore": 70,
+  "pandascore": {pandascore},
   "tendencia": "mejora",
   "titular": "Una frase que resume el estado del restaurante",
   "resumen_general": "Párrafo de 3-4 frases describiendo la impresión general según las reseñas",
@@ -510,8 +523,8 @@ Responde SOLO con un JSON válido con esta estructura exacta, sin texto adiciona
 }}
 
 Reglas:
-- pandascore: número 0-100 (0=reputación muy dañada, 100=excelente)
-- tendencia: "mejora", "estable" o "deterioro"
+- pandascore: usa EXACTAMENTE el valor {pandascore} que se te ha proporcionado, no lo cambies
+- tendencia: "mejora", "estable" o "deterioro" (basada en el histórico si existe, o en la distribución de sentimientos)
 - Directo, natural, sin tecnicismos
 - No menciones que eres IA ni el proceso de análisis"""
 

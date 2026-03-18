@@ -202,7 +202,8 @@ async def lanzar_analisis(rid: int, restaurante: dict, update: Update):
         return
 
     await update.message.reply_text("Generando informe consultor con Claude...")
-    texto = generar_informe_consultor(nombre, ciudad, cocina, contexto, hist_txt)
+    pandascore = kpis_locales.get("pandascore", 50)
+    texto = generar_informe_consultor(nombre, ciudad, cocina, contexto, hist_txt, pandascore)
     resultado = parse_claude_json(texto)
 
     analisis_id = guardar_analisis_y_metricas(rid, resultado, texto, kpis_locales)
@@ -220,8 +221,6 @@ async def lanzar_analisis(rid: int, restaurante: dict, update: Update):
         f"  · {p}" for p in resultado.get("otros_problemas", [])
     )
     accion = safe_text(resultado.get("accion_hoy", "")).replace("_", " ").replace("*", " ")
-    resumen_tg = safe_text(resultado.get("resumen_telegram", ""))
-
     msg = (
         f"Análisis completado: {nombre}\n"
         f"PandaScore: {resultado.get('pandascore','?')}/100  {t_sym} {t.capitalize()}\n\n"
