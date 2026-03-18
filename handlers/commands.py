@@ -19,20 +19,10 @@ from services.claude_service import analizar_resenas_lote
 
 logger = logging.getLogger("chefpanda-admin")
 
-PESOS_DIMENSIONES = {
-    "food_quality":     0.30,
-    "service":          0.25,
-    "waiting_time":     0.15,
-    "ambience":         0.10,
-    "price_perception": 0.10,
-    "cleanliness":      0.10,
-}
-
-
 def _calcular_sentimiento_score(temas: list) -> tuple:
     """
-    Calcula sentimiento_score (1-5) y metadata de dimensiones a partir de temas_detectados.
-    Normaliza usando solo los pesos de las dimensiones presentes.
+    Calcula sentimiento_score (1-5) como media aritmética de las dimensiones mencionadas.
+    Si solo se mencionan 2 dimensiones (food=4, price=1) → score = 2.5, no 3.25.
     Retorna (score | None, metadata_dict).
     """
     scores = {
@@ -43,15 +33,7 @@ def _calcular_sentimiento_score(temas: list) -> tuple:
     if not scores:
         return None, {}
 
-    peso_total = sum(PESOS_DIMENSIONES.get(d, 0) for d in scores)
-    if peso_total == 0:
-        return None, scores
-
-    score = sum(
-        scores[d] * PESOS_DIMENSIONES.get(d, 0)
-        for d in scores
-    ) / peso_total
-
+    score = sum(scores.values()) / len(scores)
     return round(score, 2), scores
 
 
@@ -325,6 +307,56 @@ async def desactivar_fuente(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {e}")
 
 
+async def _analizar_resenas_pendientes(rid: int, update) -> int:
+    """Analiza las reseñas sin sentimiento. Devuelve el número de reseñas analizadas."""
+    LOTE = 15
+    resenas = get_resenas_sin_analizar(rid)
+    if not resenas:
+        return 0
+
+    total = len(resenas)
+    n_lotes = (total + LOTE - 1) // LOTE
+    await update.message.reply_text(
+        f"{total} reseñas nuevas sin analizar — procesando en {n_lotes} lotes..."
+    )
+
+    analizadas = 0
+    errores = 0
+    for i in range(0, total, LOTE):
+        lote = resenas[i:i + LOTE]
+        lote_num = i // LOTE + 1
+        try:
+            resultados = analizar_resenas_lote(lote)
+            for resena, res in zip(lote, resultados):
+                try:
+                    temas = res.get("temas_detectados", [])
+                    score, dim_scores = _calcular_sentimiento_score(temas)
+                    sb_update_by_id("resenas", resena["id"], {
+                        "sentimiento":        res.get("sentimiento"),
+                        "sentimiento_score":  score,
+                        "temas_detectados":   temas,
+                        "platos_mencionados": res.get("platos_mencionados", []),
+                        "es_destacable":      res.get("es_destacable", False),
+                        "es_critica":         res.get("es_critica", False),
+                        "requiere_respuesta": res.get("requiere_respuesta", False),
+                        "metadata":           dim_scores,
+                    })
+                    analizadas += 1
+                except Exception as e:
+                    logger.warning("Error actualizando reseña %d: %s", resena["id"], e)
+                    errores += 1
+        except Exception as e:
+            logger.warning("Error en lote %d: %s", lote_num, e)
+            errores += len(lote)
+
+        if lote_num % 3 == 0 or lote_num == n_lotes:
+            await update.message.reply_text(
+                f"Lote {lote_num}/{n_lotes} — {analizadas} analizadas"
+            )
+
+    return analizadas
+
+
 async def analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -332,36 +364,39 @@ async def analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Uso: /analizar ID [forzar]")
         return
     try:
-        rid   = int(ctx.args[0])
-        flag  = safe_text(ctx.args[1]).lower() if len(ctx.args) > 1 else ""
-        forzar = flag == "forzar"
+        rid    = int(ctx.args[0])
+        forzar = len(ctx.args) > 1 and safe_text(ctx.args[1]).lower() == "forzar"
 
         c = get_restaurante(rid)
         if not c:
             await update.message.reply_text(f"No existe ID {rid}")
             return
 
-        ultimo_scrape   = c.get("ultima_actualizacion_resenas")
-        ultimo_analisis = c.get("ultima_analisis")
-
-        if not ultimo_scrape:
+        if not c.get("ultima_actualizacion_resenas"):
             await update.message.reply_text(
                 f"No hay reseñas scrapeadas para {c['nombre']}.\n\n"
                 f"Ejecuta primero:\npython scrape.py {rid}"
             )
             return
 
-        if not forzar and ultimo_scrape and ultimo_analisis:
-            if str(ultimo_analisis) >= str(ultimo_scrape):
+        # Paso 1: analizar reseñas pendientes automáticamente
+        pendientes = get_resenas_sin_analizar(rid)
+        if pendientes:
+            await _analizar_resenas_pendientes(rid, update)
+        elif not forzar:
+            # Sin pendientes y sin forzar: comprobar si hay algo nuevo
+            ultimo_scrape   = c.get("ultima_actualizacion_resenas")
+            ultimo_analisis = c.get("ultima_analisis")
+            if ultimo_analisis and str(ultimo_analisis) >= str(ultimo_scrape):
                 await update.message.reply_text(
-                    f"No hay reseñas nuevas desde el último análisis.\n"
+                    f"Todo al día para {c['nombre']}.\n"
                     f"Último scrape:   {ultimo_scrape}\n"
-                    f"Último análisis: {ultimo_analisis}\n\n"
-                    f"Usa /analizar {rid} forzar para regenerar."
+                    f"Último informe:  {ultimo_analisis}\n\n"
+                    f"Usa /analizar {rid} forzar para regenerar el informe."
                 )
                 return
 
-        await update.message.reply_text(f"Analizando {c['nombre']}...")
+        # Paso 2: generar informe consultor
         await lanzar_analisis(rid, c, update)
 
     except Exception as e:
