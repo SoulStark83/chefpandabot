@@ -21,10 +21,8 @@ def generar_pdf(restaurante: str, ciudad: str, resultado: dict):
     MARRON   = HexColor('#5C3D2E')
     MARRON_L = HexColor('#F5EDE8')
     ROSA     = HexColor('#E8527A')
-    VERDE    = HexColor('#2D7A4F')
     VERDE_L  = HexColor('#E8F5EE')
     ROJO     = HexColor('#C0392B')
-    AMBER    = HexColor('#E8890C')
     GRIS     = HexColor('#F7F5F3')
     BORDE    = HexColor('#E0D5D0')
     MUTED    = HexColor('#8A7A72')
@@ -65,12 +63,12 @@ def generar_pdf(restaurante: str, ciudad: str, resultado: dict):
             Spacer(1, 3 * mm),
         ]
 
-    def bullet_list(items, color=VERDE, prefix='+'):
+    def bullet_list(items, color_hex='#2D7A4F', prefix='+'):
         elems = []
         for item in items:
             elems.append(
                 Paragraph(
-                    f'<font color="#{color.hexval()[1:]}"><b>{prefix}</b></font>  {item}',
+                    f'<font color="{color_hex}"><b>{prefix}</b></font>  {item}',
                     st('li', fontSize=9, leading=14, spaceAfter=4)
                 )
             )
@@ -134,7 +132,7 @@ def generar_pdf(restaurante: str, ciudad: str, resultado: dict):
 
     # 02 – Lo que valoran
     S += section_header('02', 'LO QUE MÁS VALORAN LOS CLIENTES')
-    S += bullet_list(resultado.get('lo_que_valoran', []), color=VERDE, prefix='+')
+    S += bullet_list(resultado.get('lo_que_valoran', []), color_hex='#2D7A4F', prefix='+')
 
     # 03 – Problema principal
     S += section_header('03', 'EL PRINCIPAL PROBLEMA DETECTADO')
@@ -157,7 +155,7 @@ def generar_pdf(restaurante: str, ciudad: str, resultado: dict):
     otros = resultado.get('otros_problemas', [])
     if otros:
         S += section_header('04', 'COSAS QUE PUEDEN AFECTAR LA EXPERIENCIA')
-        S += bullet_list(otros, color=AMBER, prefix='·')
+        S += bullet_list(otros, color_hex='#E8890C', prefix='·')
 
     # 05 – Patrón curioso
     patron = resultado.get('patron_curioso', '')
@@ -167,7 +165,7 @@ def generar_pdf(restaurante: str, ciudad: str, resultado: dict):
 
     # 06 – Oportunidades
     S += section_header('06', 'OPORTUNIDADES DE MEJORA SENCILLAS')
-    S += bullet_list(resultado.get('oportunidades', []), color=VERDE, prefix='→')
+    S += bullet_list(resultado.get('oportunidades', []), color_hex='#2D7A4F', prefix='→')
 
     # 07 – Conclusión
     S += section_header('07', 'CONCLUSIÓN')
