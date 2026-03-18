@@ -181,6 +181,18 @@ def get_todas_resenas(rid: int, limit: int = 500) -> List[dict]:
     )
 
 
+def get_resenas_analizadas(rid: int, limit: int = 500) -> List[dict]:
+    """Reseñas con datos de análisis completos (sentimiento + dimensiones)."""
+    return sb_get(
+        "resenas",
+        f"restaurante_id=eq.{rid}&sentimiento=not.is.null"
+        f"&order=fecha_scrape.desc,id.desc&limit={limit}",
+        "id,nota,texto,plataforma,autor,fecha_resena,fecha_resena_raw,"
+        "tiene_respuesta,sentimiento,sentimiento_score,temas_detectados,"
+        "platos_mencionados,es_critica,requiere_respuesta,es_destacable"
+    )
+
+
 # ── COMPETIDORES ───────────────────────────────────────────
 
 def get_competidores(rid: int) -> List[dict]:

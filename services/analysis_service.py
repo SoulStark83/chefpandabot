@@ -13,8 +13,8 @@ from db.supabase_client import (
 )
 from handlers.helpers import safe_text
 from services.claude_service import (
-    construir_contexto_resenas, contrastar_kpis_web,
-    analizar_con_claude, parse_claude_json,
+    construir_contexto_analizadas,
+    generar_informe_consultor, parse_claude_json,
 )
 from services.pdf_service import generar_pdf, upload_pdf_to_storage
 
@@ -94,15 +94,7 @@ def guardar_oportunidades(analisis_id: int, rid: int, resultado: dict):
         sb_insert("analisis_oportunidades", filas)
 
 
-def _safe_score(resultado, key):
-    try:
-        v = resultado.get(key)
-        return float(v) if v is not None else None
-    except Exception:
-        return None
-
-
-def guardar_analisis_y_metricas(rid: int, resultado: dict, texto: str, kpis_locales: dict, kpis_web: str):
+def guardar_analisis_y_metricas(rid: int, resultado: dict, texto: str, kpis_locales: dict):
     hoy = date.today()
     semana = hoy.isocalendar()[1]
 
@@ -117,29 +109,17 @@ def guardar_analisis_y_metricas(rid: int, resultado: dict, texto: str, kpis_loca
         "titular":          resultado.get("titular", ""),
         "resumen_telegram": resultado.get("resumen_telegram", ""),
         "informe_texto":    texto,
-        "contexto_raw": {
-            "kpis_web":     kpis_web,
-            "kpis_locales": kpis_locales,
-        },
+        "contexto_raw":     {"kpis_locales": kpis_locales},
         "estado":           "ready",
         "version_modelo":   VERSION_MODELO,
         "version_prompt":   VERSION_PROMPT,
-        # Scores (0-10)
-        "score_reputacion":          _safe_score(resultado, "score_reputacion"),
-        "score_experiencia":         _safe_score(resultado, "score_experiencia"),
-        "score_engagement":          _safe_score(resultado, "score_engagement"),
-        "score_presencia_social":    _safe_score(resultado, "score_presencia_social"),
-        "score_conversion_digital":  _safe_score(resultado, "score_conversion_digital"),
-        "score_ticket_medio":        _safe_score(resultado, "score_ticket_medio"),
-        "score_conversion_calle":    _safe_score(resultado, "score_conversion_calle"),
-        "score_riesgo_reputacional": _safe_score(resultado, "score_riesgo_reputacional"),
-        # Textos ejecutivos
-        "resumen_ejecutivo":     safe_text(resultado.get("resumen_ejecutivo")) or None,
-        "posicionamiento_actual":safe_text(resultado.get("posicionamiento_actual")) or None,
-        "riesgo_principal":      safe_text(resultado.get("riesgo_principal")) or None,
-        "oportunidad_principal": safe_text(resultado.get("oportunidad_principal")) or None,
-        "conclusion_final":      safe_text(resultado.get("conclusion_final")) or None,
-        "perdida_estimable":     safe_text(resultado.get("perdida_estimable")) or None,
+        # Textos del informe consultor
+        "resumen_ejecutivo":      safe_text(resultado.get("resumen_general")) or None,
+        "posicionamiento_actual": safe_text(resultado.get("patron_curioso")) or None,
+        "riesgo_principal":       safe_text(resultado.get("problema_principal")) or None,
+        "oportunidad_principal":  safe_text(", ".join(resultado.get("oportunidades", []))) or None,
+        "conclusion_final":       safe_text(resultado.get("conclusion")) or None,
+        "perdida_estimable":      safe_text(resultado.get("accion_hoy")) or None,
     }, "restaurante_id,anio,semana")
 
     analisis_id = analisis_rows[0]["id"]
@@ -195,63 +175,56 @@ async def lanzar_analisis(rid: int, restaurante: dict, update: Update):
     hist_txt = ""
     if historico:
         hist_txt = "HISTÓRICO:\n" + "".join(
-            f"- Semana {h.get('semana')}/{h.get('anio')}: Score {h.get('pandascore')}\n"
+            f"- Semana {h.get('semana')}/{h.get('anio')}: PandaScore {h.get('pandascore')}\n"
             for h in historico
         )
 
-    await update.message.reply_text("Leyendo reseñas de la base de datos...")
-    contexto_resenas, tiene_resenas, kpis_locales = construir_contexto_resenas(rid, nombre, ciudad)
+    await update.message.reply_text("Leyendo reseñas analizadas de la base de datos...")
+    contexto, tiene_datos, kpis_locales = construir_contexto_analizadas(rid, nombre, ciudad)
 
-    if not tiene_resenas:
+    if not tiene_datos:
         await update.message.reply_text(
-            f"No hay reseñas en BBDD para {nombre}.\n"
-            f"Ejecuta primero el scraper: python scrape.py {rid}"
+            f"No hay reseñas analizadas para {nombre}.\n\n"
+            f"Ejecuta primero:\n"
+            f"1. python scrape.py {rid}  (obtener reseñas)\n"
+            f"2. /analizar_resenas {rid}  (analizar sentimientos)"
         )
         return
 
-    await update.message.reply_text("Verificando KPIs públicos...")
-    kpis_web = contrastar_kpis_web(nombre, ciudad)
-
-    await update.message.reply_text("Generando análisis con Claude...")
-    texto = analizar_con_claude(nombre, ciudad, cocina, contexto_resenas, kpis_web, hist_txt)
+    await update.message.reply_text("Generando informe consultor con Claude...")
+    texto = generar_informe_consultor(nombre, ciudad, cocina, contexto, hist_txt)
     resultado = parse_claude_json(texto)
 
-    analisis_id = guardar_analisis_y_metricas(rid, resultado, texto, kpis_locales, kpis_web)
+    analisis_id = guardar_analisis_y_metricas(rid, resultado, texto, kpis_locales)
 
+    # ── Mensaje Telegram ──────────────────────────────────────
     t = resultado.get("tendencia", "estable")
-    t_e = {"mejora": "Mejora", "deterioro": "Bajando", "estable": "Estable"}.get(t, t)
-    problemas  = "\n".join(["  - " + str(p) for p in resultado.get("problemas_top3", [])])
-    fortalezas = "\n".join(["  + " + str(f) for f in resultado.get("fortalezas_top3", [])])
-    titular    = safe_text(resultado.get("titular")).replace("_", " ").replace("*", " ").replace("`", " ")
-    accion     = safe_text(resultado.get("accion_urgente")).replace("_", " ").replace("*", " ")
+    t_sym = {"mejora": "↑", "deterioro": "↓", "estable": "→"}.get(t, "→")
+    titular = safe_text(resultado.get("titular", "")).replace("_", " ").replace("*", " ")
 
-    scores_txt = ""
-    for key, label in [
-        ("score_reputacion",         "Reputación"),
-        ("score_experiencia",        "Experiencia"),
-        ("score_engagement",         "Engagement"),
-        ("score_conversion_digital", "Conv. digital"),
-    ]:
-        v = resultado.get(key)
-        if v is not None:
-            scores_txt += f"  {label}: {v}/10\n"
+    valorado = "\n".join(
+        f"  + {v}" for v in resultado.get("lo_que_valoran", [])
+    )
+    problema = safe_text(resultado.get("problema_principal", "")).replace("_", " ")
+    otros = "\n".join(
+        f"  · {p}" for p in resultado.get("otros_problemas", [])
+    )
+    accion = safe_text(resultado.get("accion_hoy", "")).replace("_", " ").replace("*", " ")
+    resumen_tg = safe_text(resultado.get("resumen_telegram", ""))
 
     msg = (
-        f"Análisis completado: {nombre}\n\n"
-        f"PandaScore: {resultado.get('pandascore','?')}/100  {t_e}\n"
-        f"En 30 días: {resultado.get('pandascore_estimado_30dias','?')}/100\n\n"
+        f"Análisis completado: {nombre}\n"
+        f"PandaScore: {resultado.get('pandascore','?')}/100  {t_sym} {t.capitalize()}\n\n"
+        f"{titular}\n\n"
+        f"LO QUE MÁS VALORAN:\n{valorado}\n\n"
+        f"PROBLEMA PRINCIPAL:\n  {problema}\n"
     )
-    if scores_txt:
-        msg += "Scores:\n" + scores_txt + "\n"
-    if resultado.get("riesgo_principal"):
-        msg += f"Riesgo: {resultado['riesgo_principal']}\n\n"
+    if otros:
+        msg += f"\nOTROS PROBLEMAS:\n{otros}\n"
+    if resultado.get("patron_curioso"):
+        msg += f"\nDESTACO:\n  {safe_text(resultado['patron_curioso'])}\n"
+    msg += f"\nACCIÓN PARA HOY:\n  {accion}\n\nGenerando PDF..."
 
-    msg += (
-        titular + "\n\nFortalezas:\n" + fortalezas +
-        "\n\nProblemas:\n" + problemas +
-        "\n\nAcción urgente:\n" + accion +
-        "\n\nGenerando PDF..."
-    )
     await update.message.reply_text(msg[:4000])
 
     try:

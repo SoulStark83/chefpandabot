@@ -2,11 +2,12 @@
 import json
 import logging
 import re
+from collections import Counter
 import urllib.request as ur
 import urllib.error as ue
 
 from config.settings import ANTHROPIC_KEY, VERSION_MODELO
-from db.supabase_client import sb_get
+from db.supabase_client import sb_get, get_resenas_analizadas
 from handlers.helpers import safe_text, truncate
 
 logger = logging.getLogger("chefpanda-admin")
@@ -348,4 +349,171 @@ Responde SOLO en JSON válido sin texto adicional:
 }}"""
 
     data = claude_call([{"role": "user", "content": prompt}], max_tokens=4000)
+    return extraer_texto(data)
+
+
+# ── INFORME CONSULTOR (usa datos ya analizados) ────────────
+
+DIM_LABELS = {
+    "food_quality":     "Calidad de la comida",
+    "service":          "Servicio",
+    "waiting_time":     "Tiempo de espera",
+    "ambience":         "Ambiente",
+    "price_perception": "Relación calidad-precio",
+    "cleanliness":      "Limpieza",
+}
+
+
+def construir_contexto_analizadas(rid: int, nombre: str, ciudad: str):
+    """
+    Construye un contexto estructurado a partir de las reseñas ya analizadas
+    (con sentimiento, dimensiones, platos). Devuelve (contexto, tiene_datos, kpis).
+    """
+    resenas = get_resenas_analizadas(rid, limit=500)
+    if not resenas:
+        return "", False, {"total": 0, "media": None}
+
+    total = len(resenas)
+    notas = [float(r["nota"]) for r in resenas if r.get("nota") is not None]
+    nota_media = round(sum(notas) / len(notas), 2) if notas else None
+
+    sent_count = Counter(r.get("sentimiento") for r in resenas if r.get("sentimiento"))
+    criticas = sum(1 for r in resenas if r.get("es_critica"))
+    sin_responder = sum(1 for r in resenas if r.get("requiere_respuesta"))
+
+    # Dimensiones: suma y conteo
+    dim_scores: dict = {}
+    dim_counts: dict = {}
+    for r in resenas:
+        for t in (r.get("temas_detectados") or []):
+            dim = t.get("dimension")
+            score = t.get("score")
+            if dim and score is not None:
+                try:
+                    dim_scores[dim] = dim_scores.get(dim, 0) + float(score)
+                    dim_counts[dim] = dim_counts.get(dim, 0) + 1
+                except Exception:
+                    pass
+
+    # Platos más mencionados
+    platos_counter: Counter = Counter()
+    platos_percepcion: dict = {}
+    for r in resenas:
+        for p in (r.get("platos_mencionados") or []):
+            nombre_plato = p.get("plato")
+            perc = p.get("percepcion", "neutra")
+            if nombre_plato:
+                platos_counter[nombre_plato] += 1
+                platos_percepcion.setdefault(nombre_plato, Counter())[perc] += 1
+
+    ctx = f"RESTAURANTE: {nombre} | CIUDAD: {safe_text(ciudad).upper()}\n\n"
+    ctx += f"DATOS DE ANÁLISIS ({total} reseñas analizadas):\n\n"
+    ctx += "STATS GENERALES:\n"
+    ctx += f"- Nota media: {nota_media}/5\n"
+    ctx += (
+        f"- Sentimiento: {sent_count.get('positivo',0)} positivas | "
+        f"{sent_count.get('neutro',0)} neutras | {sent_count.get('negativo',0)} negativas\n"
+    )
+    ctx += f"- Reseñas críticas (≤2★): {criticas}\n"
+    ctx += f"- Requieren respuesta del propietario: {sin_responder}\n\n"
+
+    if dim_scores:
+        ctx += "SCORES POR DIMENSIÓN (media de todas las reseñas):\n"
+        for dim, total_score in sorted(dim_scores.items(), key=lambda x: -x[1] / dim_counts[x[0]]):
+            n = dim_counts[dim]
+            media = round(total_score / n, 2)
+            label = DIM_LABELS.get(dim, dim)
+            ctx += f"- {label}: {media}/5 (mencionada en {n} reseñas)\n"
+        ctx += "\n"
+
+    if platos_counter:
+        ctx += "PLATOS MÁS MENCIONADOS:\n"
+        for plato, count in platos_counter.most_common(8):
+            percepcs = platos_percepcion.get(plato, Counter())
+            total_p = sum(percepcs.values())
+            pct_pos = round(percepcs.get("positiva", 0) / total_p * 100) if total_p else 0
+            ctx += f"- {plato}: {count} veces ({pct_pos}% valoración positiva)\n"
+        ctx += "\n"
+
+    # Muestra de reseñas positivas
+    pos = [r for r in resenas if r.get("sentimiento") == "positivo" and len(safe_text(r.get("texto"))) > 20][:5]
+    if pos:
+        ctx += "RESEÑAS POSITIVAS DESTACADAS:\n"
+        for r in pos:
+            fecha = r.get("fecha_resena") or r.get("fecha_resena_raw") or "?"
+            nota_str = f"{r['nota']}★ " if r.get("nota") is not None else ""
+            resp = "[RESPONDIDA]" if r.get("tiene_respuesta") else "[SIN RESPUESTA]"
+            ctx += f"[{nota_str}{r.get('autor','?')} – {fecha}] {resp}\n"
+            ctx += f"\"{truncate(safe_text(r.get('texto')), 300)}\"\n\n"
+
+    # Muestra de reseñas negativas / críticas
+    neg = {r["id"]: r for r in resenas if r.get("es_critica") and len(safe_text(r.get("texto"))) > 20}
+    for r in resenas:
+        if r.get("sentimiento") == "negativo" and len(safe_text(r.get("texto"))) > 20:
+            neg[r["id"]] = r
+    neg_list = list(neg.values())[:6]
+    if neg_list:
+        ctx += "RESEÑAS NEGATIVAS Y CRÍTICAS:\n"
+        for r in neg_list:
+            fecha = r.get("fecha_resena") or r.get("fecha_resena_raw") or "?"
+            nota_str = f"{r['nota']}★ " if r.get("nota") is not None else ""
+            resp = "[RESPONDIDA]" if r.get("tiene_respuesta") else "[SIN RESPUESTA]"
+            ctx += f"[{nota_str}{r.get('autor','?')} – {fecha}] {resp}\n"
+            ctx += f"\"{truncate(safe_text(r.get('texto')), 300)}\"\n\n"
+
+    return ctx, True, {"total": total, "media": nota_media}
+
+
+def generar_informe_consultor(nombre: str, ciudad: str, cocina: str, contexto: str, hist_txt: str) -> str:
+    prompt = f"""Actúa como un consultor experto en experiencia de cliente en restauración.
+
+Tu objetivo no es solo analizar reseñas, sino detectar patrones que un dueño de restaurante normalmente no ve cuando lee las opiniones una a una.
+
+A partir de los datos proporcionados genera un informe claro, corto y útil para el dueño del restaurante.
+
+IMPORTANTE:
+- El informe debe estar escrito como si se lo entregaras directamente al dueño.
+- Fácil de leer, sin lenguaje técnico, centrado en clientes, reputación y experiencia.
+- USA SOLO datos reales basados en los datos proporcionados.
+
+RESTAURANTE: {nombre} | COCINA: {cocina} | CIUDAD: {ciudad}
+{hist_txt}
+
+{contexto}
+
+Responde SOLO con un JSON válido con esta estructura exacta, sin texto adicional:
+
+{{
+  "pandascore": 70,
+  "tendencia": "mejora",
+  "titular": "Una frase que resume el estado del restaurante",
+  "resumen_general": "Párrafo de 3-4 frases describiendo la impresión general según las reseñas",
+  "lo_que_valoran": [
+    "punto que aparece repetidamente en reseñas positivas",
+    "punto que aparece repetidamente en reseñas positivas",
+    "punto que aparece repetidamente en reseñas positivas"
+  ],
+  "problema_principal": "El patrón negativo más importante, con evidencia concreta de las reseñas",
+  "otros_problemas": [
+    "problema secundario que aparece en varias reseñas",
+    "problema secundario que aparece en varias reseñas"
+  ],
+  "patron_curioso": "Algo interesante que el dueño probablemente no ha visto: un empleado muy valorado, un problema muy localizado, un patrón temporal, etc.",
+  "oportunidades": [
+    "mejora sencilla y realista que se puede aplicar sin grandes cambios",
+    "mejora sencilla y realista que se puede aplicar sin grandes cambios",
+    "mejora sencilla y realista que se puede aplicar sin grandes cambios"
+  ],
+  "conclusion": "Párrafo final: qué está funcionando bien y qué debería vigilar para mejorar la reputación",
+  "accion_hoy": "La acción más concreta y realista que el dueño puede hacer HOY",
+  "resumen_telegram": "Línea 1: qué va bien\\nLínea 2: qué mejorar\\nLínea 3: acción concreta"
+}}
+
+Reglas:
+- pandascore: número 0-100 (0=reputación muy dañada, 100=excelente)
+- tendencia: "mejora", "estable" o "deterioro"
+- Directo, natural, sin tecnicismos
+- No menciones que eres IA ni el proceso de análisis"""
+
+    data = claude_call([{"role": "user", "content": prompt}], max_tokens=3000)
     return extraer_texto(data)
