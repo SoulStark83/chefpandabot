@@ -11,10 +11,11 @@ from db.supabase_client import (
     get_restaurante, get_restaurantes_activos,
     get_fuentes_restaurante, get_fuente,
     contar_resenas_restaurante, get_ultima_ejecucion_fuente,
-    get_competidores,
+    get_competidores, get_resenas_sin_analizar,
 )
 from handlers.helpers import is_admin, safe_text, is_valid_url, truncate, default_modo_for_plataforma
 from services.analysis_service import lanzar_analisis
+from services.claude_service import analizar_resenas_lote
 
 logger = logging.getLogger("chefpanda-admin")
 
@@ -35,6 +36,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/activar_fuente ID plataforma\n"
         "/desactivar_fuente ID plataforma\n\n"
         "ANÁLISIS\n"
+        "/analizar_resenas ID\n"
         "/analizar ID\n"
         "/analizar ID forzar\n\n"
         "COMPETIDORES\n"
@@ -364,6 +366,89 @@ async def cmd_competidores(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {e}")
 
 
+async def cmd_analizar_resenas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if not ctx.args:
+        await update.message.reply_text("Uso: /analizar_resenas ID")
+        return
+
+    LOTE = 15
+
+    try:
+        rid = int(ctx.args[0])
+        c = get_restaurante(rid)
+        if not c:
+            await update.message.reply_text(f"No existe ID {rid}")
+            return
+
+        resenas = get_resenas_sin_analizar(rid)
+        if not resenas:
+            await update.message.reply_text(
+                f"{c['nombre']}: no hay reseñas pendientes de análisis."
+            )
+            return
+
+        total = len(resenas)
+        n_lotes = (total + LOTE - 1) // LOTE
+        await update.message.reply_text(
+            f"Analizando reseñas de {c['nombre']}\n"
+            f"{total} reseñas · {n_lotes} lotes de {LOTE}"
+        )
+
+        analizadas = 0
+        errores = 0
+
+        for i in range(0, total, LOTE):
+            lote = resenas[i:i + LOTE]
+            lote_num = i // LOTE + 1
+
+            try:
+                resultados = analizar_resenas_lote(lote)
+
+                if len(resultados) != len(lote):
+                    logger.warning(
+                        "Lote %d: esperaba %d resultados, recibí %d",
+                        lote_num, len(lote), len(resultados)
+                    )
+
+                for resena, res in zip(lote, resultados):
+                    try:
+                        sb_update_by_id("resenas", resena["id"], {
+                            "sentimiento":       res.get("sentimiento"),
+                            "sentimiento_score": res.get("sentimiento_score"),
+                            "temas_detectados":  res.get("temas_detectados", []),
+                            "platos_mencionados":res.get("platos_mencionados", []),
+                            "es_destacable":     res.get("es_destacable", False),
+                            "es_critica":        res.get("es_critica", False),
+                            "requiere_respuesta":res.get("requiere_respuesta", False),
+                        })
+                        analizadas += 1
+                    except Exception as e:
+                        logger.warning("Error actualizando reseña %d: %s", resena["id"], e)
+                        errores += 1
+
+            except Exception as e:
+                logger.warning("Error en lote %d: %s", lote_num, e)
+                errores += len(lote)
+
+            # Progreso cada 3 lotes
+            if lote_num % 3 == 0 or lote_num == n_lotes:
+                await update.message.reply_text(
+                    f"Lote {lote_num}/{n_lotes} — {analizadas} analizadas"
+                )
+
+        await update.message.reply_text(
+            f"Análisis completado: {c['nombre']}\n"
+            f"Reseñas analizadas: {analizadas}/{total}\n"
+            f"Errores: {errores}"
+        )
+
+    except Exception as e:
+        logger.exception("Error en analizar_resenas")
+        await update.message.reply_text(f"Error: {e}")
+
+
 async def pausar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -406,5 +491,6 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("desactivar_fuente", desactivar_fuente))
     app.add_handler(CommandHandler("analizar",          analizar))
     app.add_handler(CommandHandler("competidores",      cmd_competidores))
+    app.add_handler(CommandHandler("analizar_resenas",  cmd_analizar_resenas))
     app.add_handler(CommandHandler("pausar",            pausar))
     app.add_handler(CommandHandler("activar",           activar))

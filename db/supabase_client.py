@@ -161,6 +161,17 @@ def get_ultimos_analisis(rid: int, limit: int = 3) -> List[dict]:
     )
 
 
+# ── RESEÑAS — ANÁLISIS ────────────────────────────────────
+
+def get_resenas_sin_analizar(rid: int, limit: int = 500) -> List[dict]:
+    """Reseñas que aún no tienen sentimiento calculado."""
+    return sb_get(
+        "resenas",
+        f"restaurante_id=eq.{rid}&sentimiento=is.null&order=id.asc&limit={limit}",
+        "id,nota,texto,plataforma,autor,tiene_respuesta,es_critica"
+    )
+
+
 # ── COMPETIDORES ───────────────────────────────────────────
 
 def get_competidores(rid: int) -> List[dict]:

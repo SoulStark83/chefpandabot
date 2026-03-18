@@ -147,6 +147,62 @@ def construir_contexto_resenas(rid: int, nombre: str, ciudad: str):
     return contexto, True, {"total": total, "media": nota_media}
 
 
+def analizar_resenas_lote(resenas: list) -> list:
+    """
+    Analiza un lote de reseñas y devuelve una lista de dicts con el análisis
+    estructurado de cada una, en el mismo orden.
+    """
+    import json as _json
+
+    entradas = []
+    for r in resenas:
+        entradas.append({
+            "id":    r["id"],
+            "nota":  r.get("nota"),
+            "texto": (r.get("texto") or "")[:500],
+        })
+
+    n = len(resenas)
+    prompt = f"""Analiza las siguientes {n} reseñas de un restaurante.
+Para cada reseña devuelve un objeto JSON con exactamente estos campos:
+
+- "id": el mismo id de entrada (no lo modifiques)
+- "sentimiento": "positivo", "neutro" o "negativo"
+- "sentimiento_score": número entre -1.0 (muy negativo) y 1.0 (muy positivo)
+- "temas_detectados": array de objetos con las dimensiones que se mencionan explícitamente:
+    {{"dimension": "food_quality|service|waiting_time|ambience|price_perception|cleanliness",
+      "score": 1.0-5.0,
+      "menciones": ["frase corta que lo evidencia"]}}
+  Solo incluye dimensiones mencionadas. Si no hay ninguna, devuelve array vacío.
+- "platos_mencionados": array de {{"plato": "nombre", "percepcion": "positiva|negativa|neutra"}}
+  Si no hay platos, devuelve array vacío.
+- "es_destacable": true si la reseña aporta información muy útil o es especialmente representativa
+- "es_critica": true si nota <= 2 o el sentimiento es muy negativo
+- "requiere_respuesta": true si el propietario debería responder (queja, crítica, o pregunta)
+
+Responde SOLO con un JSON array de exactamente {n} objetos, en el mismo orden que la entrada.
+Sin texto adicional, sin markdown.
+
+RESEÑAS:
+{_json.dumps(entradas, ensure_ascii=False)}"""
+
+    data = claude_call([{"role": "user", "content": prompt}], max_tokens=5000)
+    texto = extraer_texto(data)
+
+    try:
+        resultado = parse_claude_json(texto)
+        if isinstance(resultado, list):
+            return resultado
+        # Si devuelve un dict con una clave que contiene la lista
+        for v in resultado.values():
+            if isinstance(v, list):
+                return v
+    except Exception as e:
+        logger.warning("Error parseando lote de reseñas: %s", e)
+
+    return []
+
+
 def contrastar_kpis_web(nombre: str, ciudad: str) -> str:
     try:
         data = claude_call(
