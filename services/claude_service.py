@@ -150,18 +150,23 @@ def construir_contexto_resenas(rid: int, nombre: str, ciudad: str):
 
 def analizar_resenas_lote(resenas: list) -> list:
     """
-    Analiza un lote de reseñas y devuelve una lista de dicts con el análisis
-    estructurado de cada una, en el mismo orden.
+    Analiza un lote de reseñas y devuelve una lista de dicts con análisis
+    enriquecido por reseña, en el mismo orden.
     """
     import json as _json
 
     entradas = []
     for r in resenas:
-        entradas.append({
+        e = {
             "id":    r["id"],
             "nota":  r.get("nota"),
-            "texto": (r.get("texto") or "")[:500],
-        })
+            "texto": (r.get("texto") or "")[:600],
+        }
+        if r.get("respuesta_propietario"):
+            e["respuesta"] = r["respuesta_propietario"][:300]
+        if r.get("plataforma"):
+            e["plataforma"] = r["plataforma"]
+        entradas.append(e)
 
     n = len(resenas)
     prompt = f"""Analiza las siguientes {n} reseñas de un restaurante.
@@ -169,24 +174,32 @@ Para cada reseña devuelve un objeto JSON con exactamente estos campos:
 
 - "id": el mismo id de entrada (no lo modifiques)
 - "sentimiento": "positivo", "neutro" o "negativo"
-- "temas_detectados": array con las dimensiones mencionadas explícitamente en la reseña:
+- "temas_detectados": array con las dimensiones mencionadas en la reseña:
     {{"dimension": "food_quality|service|waiting_time|ambience|price_perception|cleanliness",
-      "score": número del 1.0 al 5.0 según lo que expresa la reseña,
+      "score": número del 1.0 al 5.0,
       "menciones": ["frase literal o paráfrasis corta que lo evidencia"]}}
-  Dimensiones:
-    food_quality      → calidad de la comida
-    service           → atención del personal
-    waiting_time      → tiempos de espera (score bajo = espera larga)
-    ambience          → ambiente, decoración, ruido
-    price_perception  → si el cliente siente que el precio es justo
-    cleanliness       → limpieza del local
-  IMPORTANTE: solo incluye las dimensiones que la reseña menciona explícita o implícitamente.
-  Si no hay ninguna, devuelve [].
+  Solo incluye dimensiones mencionadas explícita o implícitamente. Si no hay ninguna, devuelve [].
 - "platos_mencionados": array de {{"plato": "nombre exacto", "percepcion": "positiva|negativa|neutra"}}
   Solo platos concretos. Si no hay ninguno, devuelve [].
-- "es_destacable": true si la reseña es especialmente útil, representativa o contiene información accionable
+- "es_destacable": true si la reseña es especialmente útil o contiene información accionable
 - "es_critica": true si nota <= 2 o expresa insatisfacción grave
-- "requiere_respuesta": true si el propietario debería responder (queja, crítica grave, o pregunta directa)
+- "requiere_respuesta": true si el propietario debería responder
+- "trust_score": número 0.0-1.0 estimando la fiabilidad/veracidad de la reseña.
+    Alto (>0.7): experiencia personal detallada, coherente con la nota, menciona detalles concretos.
+    Bajo (<0.3): texto genérico, nota incoherente con el texto, señales de spam o perfil falso.
+- "actionable_score": número 0.0-1.0 estimando cuánta información útil y accionable aporta al dueño.
+    Alto: menciona problemas concretos, platos, personal, situaciones específicas.
+    Bajo: solo nota sin texto, o texto vago como "genial" o "malísimo".
+- "review_type": uno de "experiencia_personal"|"queja"|"elogio"|"sugerencia"|"pregunta"|"spam"
+- "review_quality_label": uno de "detallada"|"superficial"|"inutilizable"
+- "reviewer_segment": uno de "turista"|"local_habitual"|"evento_grupo"|"desconocido"
+    Inferido del texto: menciona visita única o ciudad lejana → turista; "como siempre" → local_habitual; "celebración/cumpleaños/grupo" → evento_grupo
+- "temas_negocio": array de áreas de negocio mencionadas (puede estar vacío []).
+    Valores posibles: "cocina"|"sala"|"digital"|"precios"|"higiene"|"logistica"|"personal"
+- "flags": array de alertas (puede estar vacío []).
+    Valores posibles: "spam_sospechoso"|"nota_texto_incoherente"|"rabia_exagerada"|"elogio_generico_sospechoso"|"posible_competidor"
+- "owner_response_assessment": si hay respuesta del propietario: "adecuada"|"inadecuada"|"mejorable". Si no hay respuesta: null.
+- "owner_response_issue": si la respuesta es inadecuada o mejorable, describe el problema en 10 palabras. Si no aplica: null.
 
 Responde SOLO con un JSON array de exactamente {n} objetos, en el mismo orden que la entrada.
 Sin texto adicional, sin markdown.
@@ -194,14 +207,13 @@ Sin texto adicional, sin markdown.
 RESEÑAS:
 {_json.dumps(entradas, ensure_ascii=False)}"""
 
-    data = claude_call([{"role": "user", "content": prompt}], max_tokens=5000)
+    data = claude_call([{"role": "user", "content": prompt}], max_tokens=6000)
     texto = extraer_texto(data)
 
     try:
         resultado = parse_claude_json(texto)
         if isinstance(resultado, list):
             return resultado
-        # Si devuelve un dict con una clave que contiene la lista
         for v in resultado.values():
             if isinstance(v, list):
                 return v
@@ -393,30 +405,40 @@ def construir_contexto_analizadas(rid: int, nombre: str, ciudad: str):
         pct_respondidas * 20
     )
 
-    # Dimensiones: suma y conteo
+    # ── Dimensiones: suma ponderada por trust_score ──
     dim_scores: dict = {}
-    dim_counts: dict = {}
+    dim_weights: dict = {}
     for r in resenas:
+        w = float(r.get("trust_score") or 0.5)  # peso: reseñas más fiables pesan más
         for t in (r.get("temas_detectados") or []):
             dim = t.get("dimension")
             score = t.get("score")
             if dim and score is not None:
                 try:
-                    dim_scores[dim] = dim_scores.get(dim, 0) + float(score)
-                    dim_counts[dim] = dim_counts.get(dim, 0) + 1
+                    dim_scores[dim]  = dim_scores.get(dim, 0)  + float(score) * w
+                    dim_weights[dim] = dim_weights.get(dim, 0) + w
                 except Exception:
                     pass
 
-    # Platos más mencionados
+    # Platos más mencionados (solo en reseñas con trust_score >= 0.4)
     platos_counter: Counter = Counter()
     platos_percepcion: dict = {}
     for r in resenas:
+        if (r.get("trust_score") or 0.5) < 0.3:
+            continue
         for p in (r.get("platos_mencionados") or []):
             nombre_plato = p.get("plato")
             perc = p.get("percepcion", "neutra")
             if nombre_plato:
                 platos_counter[nombre_plato] += 1
                 platos_percepcion.setdefault(nombre_plato, Counter())[perc] += 1
+
+    # ── Estadísticas enriquecidas ──
+    spams = sum(1 for r in resenas if "spam_sospechoso" in (r.get("flags") or []))
+    turistas = sum(1 for r in resenas if r.get("reviewer_segment") == "turista")
+    locales  = sum(1 for r in resenas if r.get("reviewer_segment") == "local_habitual")
+    resp_malas = sum(1 for r in resenas
+                     if r.get("owner_response_assessment") in ("inadecuada", "mejorable"))
 
     ctx = f"RESTAURANTE: {nombre} | CIUDAD: {safe_text(ciudad).upper()}\n\n"
     ctx += f"DATOS DE ANÁLISIS ({total} reseñas analizadas):\n\n"
@@ -427,19 +449,24 @@ def construir_contexto_analizadas(rid: int, nombre: str, ciudad: str):
         f"{sent_count.get('neutro',0)} neutras | {sent_count.get('negativo',0)} negativas\n"
     )
     ctx += f"- Reseñas críticas (≤2★): {criticas}\n"
-    ctx += f"- Requieren respuesta del propietario: {sin_responder}\n\n"
+    ctx += f"- Requieren respuesta del propietario: {sin_responder}\n"
+    ctx += f"- Posibles spam/baja fiabilidad: {spams}\n"
+    ctx += f"- Turistas: {turistas} | Clientes habituales: {locales}\n"
+    if resp_malas:
+        ctx += f"- Respuestas del propietario inadecuadas/mejorables: {resp_malas}\n"
+    ctx += "\n"
 
     if dim_scores:
-        ctx += "SCORES POR DIMENSIÓN (media de todas las reseñas):\n"
-        for dim, total_score in sorted(dim_scores.items(), key=lambda x: -x[1] / dim_counts[x[0]]):
-            n = dim_counts[dim]
-            media = round(total_score / n, 2)
+        ctx += "SCORES POR DIMENSIÓN (ponderados por fiabilidad de reseña):\n"
+        for dim, w_total in sorted(dim_scores.items(), key=lambda x: -x[1] / dim_weights[x[0]]):
+            w = dim_weights[dim]
+            media = round(w_total / w, 2)
             label = DIM_LABELS.get(dim, dim)
-            ctx += f"- {label}: {media}/5 (mencionada en {n} reseñas)\n"
+            ctx += f"- {label}: {media}/5\n"
         ctx += "\n"
 
     if platos_counter:
-        ctx += "PLATOS MÁS MENCIONADOS:\n"
+        ctx += "PLATOS MÁS MENCIONADOS (filtrado reseñas fiables):\n"
         for plato, count in platos_counter.most_common(8):
             percepcs = platos_percepcion.get(plato, Counter())
             total_p = sum(percepcs.values())
@@ -447,35 +474,52 @@ def construir_contexto_analizadas(rid: int, nombre: str, ciudad: str):
             ctx += f"- {plato}: {count} veces ({pct_pos}% valoración positiva)\n"
         ctx += "\n"
 
-    # Muestra de reseñas positivas
-    pos = [r for r in resenas if r.get("sentimiento") == "positivo" and len(safe_text(r.get("texto"))) > 20][:5]
+    # Reseñas más fiables y positivas (trust_score alto, no spam)
+    pos = sorted(
+        [r for r in resenas
+         if r.get("sentimiento") == "positivo"
+         and len(safe_text(r.get("texto"))) > 20
+         and (r.get("trust_score") or 0) >= 0.5
+         and "spam_sospechoso" not in (r.get("flags") or [])],
+        key=lambda r: -(r.get("trust_score") or 0)
+    )[:5]
     if pos:
-        ctx += "RESEÑAS POSITIVAS DESTACADAS:\n"
+        ctx += "RESEÑAS POSITIVAS MÁS FIABLES:\n"
         for r in pos:
             fecha = r.get("fecha_resena") or r.get("fecha_resena_raw") or "?"
             nota_str = f"{r['nota']}★ " if r.get("nota") is not None else ""
             resp = "[RESPONDIDA]" if r.get("tiene_respuesta") else "[SIN RESPUESTA]"
-            ctx += f"[{nota_str}{r.get('autor','?')} – {fecha}] {resp}\n"
+            segmento = r.get("reviewer_segment") or "?"
+            ctx += f"[{nota_str}{r.get('autor','?')} – {fecha} | {segmento}] {resp}\n"
             ctx += f"\"{truncate(safe_text(r.get('texto')), 300)}\"\n\n"
 
-    # Muestra de reseñas negativas / críticas
-    neg = {r["id"]: r for r in resenas if r.get("es_critica") and len(safe_text(r.get("texto"))) > 20}
+    # Reseñas negativas/críticas más fiables
+    neg_pool = {}
     for r in resenas:
-        if r.get("sentimiento") == "negativo" and len(safe_text(r.get("texto"))) > 20:
-            neg[r["id"]] = r
-    neg_list = list(neg.values())[:6]
+        if (r.get("es_critica") or r.get("sentimiento") == "negativo") \
+                and len(safe_text(r.get("texto"))) > 20 \
+                and (r.get("trust_score") or 0) >= 0.3:
+            neg_pool[r["id"]] = r
+    neg_list = sorted(neg_pool.values(), key=lambda r: -(r.get("trust_score") or 0))[:6]
     if neg_list:
-        ctx += "RESEÑAS NEGATIVAS Y CRÍTICAS:\n"
+        ctx += "RESEÑAS NEGATIVAS Y CRÍTICAS MÁS FIABLES:\n"
         for r in neg_list:
             fecha = r.get("fecha_resena") or r.get("fecha_resena_raw") or "?"
             nota_str = f"{r['nota']}★ " if r.get("nota") is not None else ""
             resp = "[RESPONDIDA]" if r.get("tiene_respuesta") else "[SIN RESPUESTA]"
-            ctx += f"[{nota_str}{r.get('autor','?')} – {fecha}] {resp}\n"
-            ctx += f"\"{truncate(safe_text(r.get('texto')), 300)}\"\n\n"
+            flags = ", ".join(r.get("flags") or [])
+            ctx += f"[{nota_str}{r.get('autor','?')} – {fecha}] {resp}"
+            if flags:
+                ctx += f" [{flags}]"
+            ctx += "\n"
+            ctx += f"\"{truncate(safe_text(r.get('texto')), 300)}\"\n"
+            if r.get("owner_response_issue"):
+                ctx += f"⚠ Respuesta propietario: {r['owner_response_issue']}\n"
+            ctx += "\n"
 
-    # Dimensiones: media por dimensión
+    # Dimensiones: media ponderada por dimensión
     dims_medias = {
-        dim: round(dim_scores[dim] / dim_counts[dim], 2)
+        dim: round(dim_scores[dim] / dim_weights[dim], 2)
         for dim in dim_scores
     }
 

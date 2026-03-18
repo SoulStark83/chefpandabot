@@ -171,11 +171,11 @@ def generar_pdf(restaurante: str, ciudad: str, resultado: dict, kpis: dict = Non
         Paragraph('% Positivas', S_MUTED),
     ]
     kpi_values = [
-        Paragraph(f'<font size="24" color="{ps_color}"><b>{ps}</b></font>', S_CTR),
-        Paragraph(f'<font size="13" color="{tend_color}"><b>{tend_sym}</b></font>', S_CTR),
-        Paragraph(f'<font size="18" color="#5C3D2E"><b>{nota_str}</b></font>', S_CTR),
-        Paragraph(f'<font size="18" color="#5C3D2E"><b>{total_res}</b></font>', S_CTR),
-        Paragraph(f'<font size="18" color="#2D7A4F"><b>{pct_pos}%</b></font>', S_CTR),
+        Paragraph(f'<font size="20" color="{ps_color}"><b>{ps}</b></font>', S_CTR),
+        Paragraph(f'<font size="11" color="{tend_color}"><b>{tend_sym}</b></font>', S_CTR),
+        Paragraph(f'<font size="16" color="#5C3D2E"><b>{nota_str}</b></font>', S_CTR),
+        Paragraph(f'<font size="16" color="#5C3D2E"><b>{total_res}</b></font>', S_CTR),
+        Paragraph(f'<font size="16" color="#2D7A4F"><b>{pct_pos}%</b></font>', S_CTR),
     ]
     S += [Table([kpi_labels, kpi_values], colWidths=[cw] * 5,
                 style=TableStyle([

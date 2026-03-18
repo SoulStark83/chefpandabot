@@ -332,14 +332,23 @@ async def _analizar_resenas_pendientes(rid: int, update) -> int:
                     temas = res.get("temas_detectados", [])
                     score, dim_scores = _calcular_sentimiento_score(temas)
                     sb_update_by_id("resenas", resena["id"], {
-                        "sentimiento":        res.get("sentimiento"),
-                        "sentimiento_score":  score,
-                        "temas_detectados":   temas,
-                        "platos_mencionados": res.get("platos_mencionados", []),
-                        "es_destacable":      res.get("es_destacable", False),
-                        "es_critica":         res.get("es_critica", False),
-                        "requiere_respuesta": res.get("requiere_respuesta", False),
-                        "metadata":           dim_scores,
+                        "sentimiento":               res.get("sentimiento"),
+                        "sentimiento_score":         score,
+                        "temas_detectados":          temas,
+                        "platos_mencionados":        res.get("platos_mencionados", []),
+                        "es_destacable":             res.get("es_destacable", False),
+                        "es_critica":                res.get("es_critica", False),
+                        "requiere_respuesta":        res.get("requiere_respuesta", False),
+                        "metadata":                  dim_scores,
+                        "trust_score":               res.get("trust_score"),
+                        "actionable_score":          res.get("actionable_score"),
+                        "review_type":               res.get("review_type"),
+                        "review_quality_label":      res.get("review_quality_label"),
+                        "reviewer_segment":          res.get("reviewer_segment"),
+                        "temas_negocio":             res.get("temas_negocio", []),
+                        "flags":                     res.get("flags", []),
+                        "owner_response_assessment": res.get("owner_response_assessment"),
+                        "owner_response_issue":      res.get("owner_response_issue"),
                     })
                     analizadas += 1
                 except Exception as e:
@@ -490,13 +499,22 @@ async def cmd_analizar_resenas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         score, dim_scores = _calcular_sentimiento_score(temas)
 
                         sb_update_by_id("resenas", resena["id"], {
-                            "sentimiento":        res.get("sentimiento"),
-                            "sentimiento_score":  score,
-                            "temas_detectados":   temas,
-                            "platos_mencionados": res.get("platos_mencionados", []),
-                            "es_destacable":      res.get("es_destacable", False),
-                            "es_critica":         res.get("es_critica", False),
-                            "requiere_respuesta": res.get("requiere_respuesta", False),
+                            "sentimiento":               res.get("sentimiento"),
+                            "sentimiento_score":         score,
+                            "temas_detectados":          temas,
+                            "platos_mencionados":        res.get("platos_mencionados", []),
+                            "es_destacable":             res.get("es_destacable", False),
+                            "es_critica":                res.get("es_critica", False),
+                            "requiere_respuesta":        res.get("requiere_respuesta", False),
+                            "trust_score":               res.get("trust_score"),
+                            "actionable_score":          res.get("actionable_score"),
+                            "review_type":               res.get("review_type"),
+                            "review_quality_label":      res.get("review_quality_label"),
+                            "reviewer_segment":          res.get("reviewer_segment"),
+                            "temas_negocio":             res.get("temas_negocio", []),
+                            "flags":                     res.get("flags", []),
+                            "owner_response_assessment": res.get("owner_response_assessment"),
+                            "owner_response_issue":      res.get("owner_response_issue"),
                             "metadata":           dim_scores,
                         })
                         analizadas += 1

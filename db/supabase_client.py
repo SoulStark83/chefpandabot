@@ -168,7 +168,8 @@ def get_resenas_sin_analizar(rid: int, limit: int = 500) -> List[dict]:
     return sb_get(
         "resenas",
         f"restaurante_id=eq.{rid}&sentimiento=is.null&order=id.asc&limit={limit}",
-        "id,nota,texto,plataforma,autor,tiene_respuesta,es_critica"
+        "id,nota,texto,titulo,plataforma,autor,idioma,"
+        "fecha_resena,fecha_resena_raw,tiene_respuesta,respuesta_propietario,es_critica"
     )
 
 
@@ -187,9 +188,12 @@ def get_resenas_analizadas(rid: int, limit: int = 500) -> List[dict]:
         "resenas",
         f"restaurante_id=eq.{rid}&sentimiento=not.is.null"
         f"&order=fecha_scrape.desc,id.desc&limit={limit}",
-        "id,nota,texto,plataforma,autor,fecha_resena,fecha_resena_raw,"
+        "id,nota,texto,plataforma,autor,idioma,fecha_resena,fecha_resena_raw,"
         "tiene_respuesta,sentimiento,sentimiento_score,temas_detectados,"
-        "platos_mencionados,es_critica,requiere_respuesta,es_destacable"
+        "platos_mencionados,es_critica,requiere_respuesta,es_destacable,"
+        "trust_score,actionable_score,review_type,review_quality_label,"
+        "reviewer_segment,temas_negocio,flags,"
+        "owner_response_assessment,owner_response_issue"
     )
 
 
