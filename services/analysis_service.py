@@ -237,7 +237,7 @@ async def lanzar_analisis(rid: int, restaurante: dict, update: Update):
     await update.message.reply_text(msg[:4000])
 
     try:
-        pdf_path = generar_pdf(nombre, ciudad, resultado)
+        pdf_path = generar_pdf(nombre, ciudad, resultado, kpis_locales)
         with open(pdf_path, "rb") as f:
             pdf_bytes = f.read()
 

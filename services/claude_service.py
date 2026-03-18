@@ -473,7 +473,38 @@ def construir_contexto_analizadas(rid: int, nombre: str, ciudad: str):
             ctx += f"[{nota_str}{r.get('autor','?')} – {fecha}] {resp}\n"
             ctx += f"\"{truncate(safe_text(r.get('texto')), 300)}\"\n\n"
 
-    return ctx, True, {"total": total, "media": nota_media, "pandascore": pandascore}
+    # Dimensiones: media por dimensión
+    dims_medias = {
+        dim: round(dim_scores[dim] / dim_counts[dim], 2)
+        for dim in dim_scores
+    }
+
+    # Top platos estructurado
+    top_platos = []
+    for plato, count in platos_counter.most_common(8):
+        percepcs = platos_percepcion.get(plato, Counter())
+        total_p = sum(percepcs.values())
+        top_platos.append({
+            "nombre":     plato,
+            "menciones":  count,
+            "pct_pos":    round(percepcs.get("positiva", 0) / total_p * 100) if total_p else 0,
+            "pct_neg":    round(percepcs.get("negativa", 0) / total_p * 100) if total_p else 0,
+        })
+
+    return ctx, True, {
+        "total":         total,
+        "media":         nota_media,
+        "pandascore":    pandascore,
+        "sentimientos":  {
+            "positivo": sent_count.get("positivo", 0),
+            "neutro":   sent_count.get("neutro", 0),
+            "negativo": sent_count.get("negativo", 0),
+        },
+        "dimensiones":   dims_medias,
+        "platos":        top_platos,
+        "criticas":      criticas,
+        "sin_responder": sin_responder,
+    }
 
 
 def generar_informe_consultor(nombre: str, ciudad: str, cocina: str, contexto: str, hist_txt: str, pandascore: int = 50) -> str:
