@@ -168,17 +168,24 @@ Para cada reseña devuelve un objeto JSON con exactamente estos campos:
 
 - "id": el mismo id de entrada (no lo modifiques)
 - "sentimiento": "positivo", "neutro" o "negativo"
-- "sentimiento_score": número entre -1.0 (muy negativo) y 1.0 (muy positivo)
-- "temas_detectados": array de objetos con las dimensiones que se mencionan explícitamente:
+- "temas_detectados": array con las dimensiones mencionadas explícitamente en la reseña:
     {{"dimension": "food_quality|service|waiting_time|ambience|price_perception|cleanliness",
-      "score": 1.0-5.0,
-      "menciones": ["frase corta que lo evidencia"]}}
-  Solo incluye dimensiones mencionadas. Si no hay ninguna, devuelve array vacío.
-- "platos_mencionados": array de {{"plato": "nombre", "percepcion": "positiva|negativa|neutra"}}
-  Si no hay platos, devuelve array vacío.
-- "es_destacable": true si la reseña aporta información muy útil o es especialmente representativa
-- "es_critica": true si nota <= 2 o el sentimiento es muy negativo
-- "requiere_respuesta": true si el propietario debería responder (queja, crítica, o pregunta)
+      "score": número del 1.0 al 5.0 según lo que expresa la reseña,
+      "menciones": ["frase literal o paráfrasis corta que lo evidencia"]}}
+  Dimensiones:
+    food_quality      → calidad de la comida
+    service           → atención del personal
+    waiting_time      → tiempos de espera (score bajo = espera larga)
+    ambience          → ambiente, decoración, ruido
+    price_perception  → si el cliente siente que el precio es justo
+    cleanliness       → limpieza del local
+  IMPORTANTE: solo incluye las dimensiones que la reseña menciona explícita o implícitamente.
+  Si no hay ninguna, devuelve [].
+- "platos_mencionados": array de {{"plato": "nombre exacto", "percepcion": "positiva|negativa|neutra"}}
+  Solo platos concretos. Si no hay ninguno, devuelve [].
+- "es_destacable": true si la reseña es especialmente útil, representativa o contiene información accionable
+- "es_critica": true si nota <= 2 o expresa insatisfacción grave
+- "requiere_respuesta": true si el propietario debería responder (queja, crítica grave, o pregunta directa)
 
 Responde SOLO con un JSON array de exactamente {n} objetos, en el mismo orden que la entrada.
 Sin texto adicional, sin markdown.

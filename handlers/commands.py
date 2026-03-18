@@ -11,13 +11,48 @@ from db.supabase_client import (
     get_restaurante, get_restaurantes_activos,
     get_fuentes_restaurante, get_fuente,
     contar_resenas_restaurante, get_ultima_ejecucion_fuente,
-    get_competidores, get_resenas_sin_analizar,
+    get_competidores, get_resenas_sin_analizar, get_todas_resenas,
 )
 from handlers.helpers import is_admin, safe_text, is_valid_url, truncate, default_modo_for_plataforma
 from services.analysis_service import lanzar_analisis
 from services.claude_service import analizar_resenas_lote
 
 logger = logging.getLogger("chefpanda-admin")
+
+PESOS_DIMENSIONES = {
+    "food_quality":     0.30,
+    "service":          0.25,
+    "waiting_time":     0.15,
+    "ambience":         0.10,
+    "price_perception": 0.10,
+    "cleanliness":      0.10,
+}
+
+
+def _calcular_sentimiento_score(temas: list) -> tuple:
+    """
+    Calcula sentimiento_score (1-5) y metadata de dimensiones a partir de temas_detectados.
+    Normaliza usando solo los pesos de las dimensiones presentes.
+    Retorna (score | None, metadata_dict).
+    """
+    scores = {
+        t["dimension"]: float(t["score"])
+        for t in (temas or [])
+        if "dimension" in t and "score" in t
+    }
+    if not scores:
+        return None, {}
+
+    peso_total = sum(PESOS_DIMENSIONES.get(d, 0) for d in scores)
+    if peso_total == 0:
+        return None, scores
+
+    score = sum(
+        scores[d] * PESOS_DIMENSIONES.get(d, 0)
+        for d in scores
+    ) / peso_total
+
+    return round(score, 2), scores
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -37,6 +72,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/desactivar_fuente ID plataforma\n\n"
         "ANÁLISIS\n"
         "/analizar_resenas ID\n"
+        "/analizar_resenas ID forzar\n"
         "/analizar ID\n"
         "/analizar ID forzar\n\n"
         "COMPETIDORES\n"
@@ -370,22 +406,23 @@ async def cmd_analizar_resenas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
     if not ctx.args:
-        await update.message.reply_text("Uso: /analizar_resenas ID")
+        await update.message.reply_text("Uso: /analizar_resenas ID [forzar]")
         return
 
     LOTE = 15
 
     try:
-        rid = int(ctx.args[0])
+        rid    = int(ctx.args[0])
+        forzar = len(ctx.args) > 1 and ctx.args[1].lower() == "forzar"
         c = get_restaurante(rid)
         if not c:
             await update.message.reply_text(f"No existe ID {rid}")
             return
 
-        resenas = get_resenas_sin_analizar(rid)
+        resenas = get_todas_resenas(rid) if forzar else get_resenas_sin_analizar(rid)
         if not resenas:
             await update.message.reply_text(
-                f"{c['nombre']}: no hay reseñas pendientes de análisis."
+                f"{c['nombre']}: no hay reseñas{'.' if forzar else ' pendientes de análisis.'}"
             )
             return
 
@@ -414,14 +451,18 @@ async def cmd_analizar_resenas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
                 for resena, res in zip(lote, resultados):
                     try:
+                        temas = res.get("temas_detectados", [])
+                        score, dim_scores = _calcular_sentimiento_score(temas)
+
                         sb_update_by_id("resenas", resena["id"], {
-                            "sentimiento":       res.get("sentimiento"),
-                            "sentimiento_score": res.get("sentimiento_score"),
-                            "temas_detectados":  res.get("temas_detectados", []),
-                            "platos_mencionados":res.get("platos_mencionados", []),
-                            "es_destacable":     res.get("es_destacable", False),
-                            "es_critica":        res.get("es_critica", False),
-                            "requiere_respuesta":res.get("requiere_respuesta", False),
+                            "sentimiento":        res.get("sentimiento"),
+                            "sentimiento_score":  score,
+                            "temas_detectados":   temas,
+                            "platos_mencionados": res.get("platos_mencionados", []),
+                            "es_destacable":      res.get("es_destacable", False),
+                            "es_critica":         res.get("es_critica", False),
+                            "requiere_respuesta": res.get("requiere_respuesta", False),
+                            "metadata":           dim_scores,
                         })
                         analizadas += 1
                     except Exception as e:

@@ -172,6 +172,15 @@ def get_resenas_sin_analizar(rid: int, limit: int = 500) -> List[dict]:
     )
 
 
+def get_todas_resenas(rid: int, limit: int = 500) -> List[dict]:
+    """Todas las reseñas del restaurante, analizadas o no."""
+    return sb_get(
+        "resenas",
+        f"restaurante_id=eq.{rid}&order=id.asc&limit={limit}",
+        "id,nota,texto,plataforma,autor,tiene_respuesta,es_critica"
+    )
+
+
 # ── COMPETIDORES ───────────────────────────────────────────
 
 def get_competidores(rid: int) -> List[dict]:
